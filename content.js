@@ -405,7 +405,37 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     if (el.querySelector('[contenteditable="false"], [data-mention], [data-type="mention"], [class*="mention" i]')) return true;
     // «@имя» осталось в поле буквальным текстом — значит, файл не выбран
     if (labelKey(inputText(el)).includes('@' + n)) return false;
+    // «@имя» из поля исчезло. Если в поле уже была картинка (ChatGPT не плодит дубли) — счётчик
+    // не вырастет, но вложение на месте: считаем, что файл выбран.
+    if (now.imgs >= 1 && now.imgs >= before.imgs) return true;
     return now.text.includes(n);
+  }
+
+  // Кнопки «удалить» у превью вложений в поле ввода. У ChatGPT они часто видны только при
+  // наведении (прозрачные), поэтому видимость не проверяем — только что кнопка рядом с картинкой.
+  function attachmentRemoveButtons() {
+    const root = composerRoot();
+    if (!root) return [];
+    const ed = findInput();
+    return $$('button', root).filter((b) => {
+      if (!b.isConnected || host.contains(b) || (ed && ed.contains(b))) return false;
+      if (!/(remove|delete|удал|убрать|закрыт|close)/i.test(`${b.getAttribute('aria-label') || ''} ${b.title || ''}`)) return false;
+      let p = b.parentElement;
+      for (let i = 0; i < 4 && p && p !== root; i++, p = p.parentElement) if (p.querySelector('img')) return true;
+      return false;
+    });
+  }
+  // Убрать все вложения из поля ввода: остатки прошлой попытки мешают выбору файла через «@»
+  async function clearAttachments() {
+    let n = 0;
+    for (let k = 0; k < 8; k++) {
+      const b = attachmentRemoveButtons()[0];
+      if (!b) break;
+      b.click(); n++;
+      await sleep(200);
+    }
+    if (n) dbg(`Убрал старых вложений из поля: ${n}`);
+    return n;
   }
   // Имя файла без случайного «@» в начале (в поле его вводить не нужно — расширение добавляет само)
   const libNameClean = () => (S.libName || '').trim().replace(/^@+/, '').trim();
@@ -971,7 +1001,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       setStatus('gen', 'Готовлю следующий, пока идёт генерация');
       const att = job.attach ? job.attach() : [];
       const inp = findInput();
-      if (inp) clearInput(inp);
+      if (inp) { clearInput(inp); await clearAttachments(); }
       if (att.length) await attachFiles(att);
       const useLib = !!(job.useLib && S.libMode && libNameClean());
       if (useLib) await insertLibraryRef(libNameClean());
@@ -989,17 +1019,13 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
 
   // После остановки / ошибки / конца: убрать из поля ввода всё, что осталось от нас —
   // заготовку следующего промпта, «@файл» и превью вложений (иначе их легко отправить случайно)
-  const ATTACH_REMOVE_RE = /(remove|удалить|убрать)[^]*(file|файл|image|изображ|attachment|вложен)|(file|файл|image|изображ|attachment|вложен)[^]*(remove|удалить|убрать)/i;
-  function cleanupComposer() {
+  async function cleanupComposer() {
     prepared = null;
     try {
       const el = findInput();
       if (!el) return;
       if (norm(inputText(el))) clearInput(el);
-      const root = composerRoot();
-      if (root) for (const b of $$('button', root)) {
-        if (isVisible(b) && ATTACH_REMOVE_RE.test(b.getAttribute('aria-label') || '')) b.click();
-      }
+      await clearAttachments();
     } catch { /* страница могла измениться — не критично */ }
   }
 
@@ -1026,7 +1052,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
         log(`${job.label}: подготовлен заранее`, 'info');
       }
       const inp = findInput();
-      if (inp && !el) clearInput(inp);
+      if (inp && !el) { clearInput(inp); await clearAttachments(); } // остатки прошлой попытки (в т.ч. «@файл») убираем
       if (!el && att.length) {
         setStatus('gen', `Прикрепляю файлы (${att.length})`);
         try { await attachFiles(att); } catch (e) {
@@ -1195,7 +1221,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       }
     }
     // Убираем за собой: заготовку следующего промпта, «@файл» и превью вложений в поле ввода
-    cleanupComposer();
+    await cleanupComposer();
     run.active = false; run.paused = false;
     stopTicker();
     updateButtons();
@@ -1850,6 +1876,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     btn.disabled = true;
     try {
       log(`Проверка @${name}…`, 'info');
+      await clearAttachments(); // старое превью от прошлой проверки мешает выбору файла
       await insertLibraryRef(name);
       log(`✓ «${name}» выбран из библиотеки — ссылка вставилась в поле ChatGPT`, 'ok');
       log('Тест ничего не отправлял. Уберите превью в поле ввода крестиком, если оно появилось', 'info');

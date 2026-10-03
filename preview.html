@@ -80,7 +80,8 @@ function updateMenu() {
   if (slowOnly && delta > 1) { menuTimer = setTimeout(closeMenu, 600); return; }
   const q = m[1].toLowerCase();
   menuTimer = setTimeout(() => {
-    const items = LIB.filter(n => n.includes(q));
+    // уже прикреплённый файл ChatGPT в меню не показывает
+    const items = LIB.filter(n => n.includes(q) && !pending.some(p => p.name === n + '.png'));
     if (!items.length) { closeMenu(); return; }
     showMenu(items.map(n => `<div ${plain ? 'class="mi"' : 'role="option" tabindex="-1"'} style="padding:6px 10px;cursor:pointer" data-n="${n}">🖼 ${n}.png</div>`).join(''));
   }, 700);
