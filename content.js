@@ -292,13 +292,23 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     return a === b || (a.length >= b.length * 0.95 && a.includes(b.slice(0, 60)) && a.includes(b.slice(-40)));
   }
 
+  // ChatGPT может перерисовать поле ввода (после отправки, при смене чата) — тогда прежняя
+  // ссылка на него «отвалилась» от страницы. Берём актуальное поле.
+  const liveInput = (el) => (el && el.isConnected && isVisible(el) ? el : findInput());
+
   function clearInput(el) {
+    el = liveInput(el);
+    if (!el) return;
     el.focus();
     if (el.tagName === 'TEXTAREA') { setTextareaValue(el, ''); return; }
-    const sel = getSelection();
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    sel.removeAllRanges(); sel.addRange(range);
+    try {
+      const sel = getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      sel.removeAllRanges(); sel.addRange(range);
+    } catch {
+      document.execCommand('selectAll', false); // запасной способ выделить всё
+    }
     document.execCommand('delete', false);
   }
   function setTextareaValue(el, v) {
@@ -331,11 +341,15 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   ];
 
   function placeCaretEnd(el) {
+    el = liveInput(el);
+    if (!el) return;
     el.focus();
     if (el.tagName === 'TEXTAREA') { el.selectionStart = el.selectionEnd = el.value.length; return; }
-    const sel = getSelection(), range = document.createRange();
-    range.selectNodeContents(el); range.collapse(false);
-    sel.removeAllRanges(); sel.addRange(range);
+    try {
+      const sel = getSelection(), range = document.createRange();
+      range.selectNodeContents(el); range.collapse(false);
+      sel.removeAllRanges(); sel.addRange(range);
+    } catch { /* поле перерисовали — каретка встанет сама при фокусе */ }
   }
   // keep=true — дописать текст в конец, не стирая то, что уже есть в поле (ссылку @файл)
   function keepMatches(el, text) {
@@ -344,15 +358,17 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   }
 
   async function typePrompt(text, keep = false) {
-    const el = findInput();
+    let el = findInput();
     if (!el) {
       dbg('Поле ввода не найдено', diag());
       throw new Error('Не найдено видимое поле ввода ChatGPT');
     }
     for (const [name, fn] of INSERT_METHODS) {
       if (keep && name === 'dom') continue; // этот способ перезаписывает всё поле и сотрёт ссылку
+      el = liveInput(el) || el; // поле могли перерисовать — берём актуальное
       if (keep) placeCaretEnd(el); else clearInput(el);
       await sleep(60);
+      el = liveInput(el) || el;
       el.focus();
       try { await fn(el, keep ? ' ' + text : text); } catch (e) { dbg(`Вставка «${name}» упала: ${e.message}`); }
       // Не ждём вслепую 0,5 с: проверяем результат каждые 80 мс, до 1,5 с
@@ -425,9 +441,10 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   let libStrategy = 'chunk';
 
   async function insertLibraryRef(name) {
-    const el = findInput();
+    let el = findInput();
     if (!el) throw new Error('Не найдено видимое поле ввода ChatGPT');
     clearInput(el); await sleep(60);
+    el = liveInput(el) || el;
     const before = composerSnapshot();
     const knownEntries = new Set(findNameEntries(name)); // совпадения, которые были на странице ДО ввода
     const knownTexts = visibleTexts();
@@ -457,6 +474,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
 
     for (const strategy of order) {
       clearInput(el); await sleep(120);
+      el = liveInput(el) || el;
       await typers[strategy]();
 
       // Enter НЕ нажимаем, пока в меню не появился пункт с именем файла:
@@ -482,6 +500,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
 
     // Не вышло: убираем за собой недописанный «@имя», чтобы он случайно не ушёл в чат
     clearInput(el);
+    el = liveInput(el) || el;
     const appeared = [...visibleTexts()].filter((t) => !knownTexts.has(t)).slice(0, 40);
     dbg('Ссылка из библиотеки не сработала', { newTextsOnPage: appeared, ...diag() });
     throw new Error(`не удалось выбрать «${name}» из библиотеки (@)`);
