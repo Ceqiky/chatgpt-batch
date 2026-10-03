@@ -1,0 +1,1671 @@
+(() => {
+  // Живая копия уже работает на странице — второй раз не запускаемся
+  if (typeof window.__cgptBatchAlive === 'function' && window.__cgptBatchAlive()) return;
+  window.__cgptBatchAlive = () => { try { return !!chrome.runtime.id; } catch { return false; } };
+  // Старая копия после обновления расширения («осиротевшая») — убираем её панель
+  document.dispatchEvent(new CustomEvent('cgpt-batch-kill'));
+  document.querySelectorAll('#cgpt-batch-host').forEach((el) => el.remove());
+
+  // ─── Селекторы ChatGPT. Если OpenAI поменяет вёрстку — править здесь. ───
+  const SEL = {
+    // Порядок важен: сначала contenteditable-редактор, textarea — только запасной вариант
+    inputList: [
+      'div#prompt-textarea[contenteditable="true"]',
+      'div.ProseMirror[contenteditable="true"]',
+      'form [contenteditable="true"][role="textbox"]',
+      'form [contenteditable="true"]',
+      'textarea#prompt-textarea',
+      'textarea[name="prompt-textarea"]',
+      'form textarea',
+    ],
+    sendList: [
+      'button[data-testid="send-button"]',
+      'button#composer-submit-button',
+      'button[aria-label*="Send prompt" i]',
+      'button[aria-label*="Отправить" i]',
+      'button[aria-label*="Send" i]',
+      'form button[type="submit"]',
+    ],
+    stop: 'button[data-testid="stop-button"], button[aria-label*="Stop stream"], button[aria-label*="Остановить"]',
+    turn: 'article[data-testid^="conversation-turn"]',
+    msg: '[data-message-author-role]',
+  };
+  // Текст, по которому видно, что картинка ещё рисуется
+  const IMAGE_PENDING_RE = /(creating image|generating image|создание изображения|создаю изображение|генерирую изображение)/i;
+  const MIN_IMG_SIZE = 200; // меньше — это иконки/аватарки
+
+  const $ = (s, r = document) => r.querySelector(s);
+  const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+  // ─── Работа в фоновой вкладке ───
+  // Chrome тормозит таймеры скрытых вкладок (до 1 раза в минуту). Поэтому во время
+  // работы фоновая часть расширения шлёт «тики» каждые 0,5 с — сообщения не тормозятся,
+  // и по ним мы досрочно «будим» все ожидающие sleep().
+  const sleepers = new Set();
+  const wakeSleepers = () => {
+    const now = Date.now();
+    for (const s of sleepers) if (now >= s.end) { sleepers.delete(s); clearTimeout(s.t); s.res(); }
+  };
+  const sleep = (ms) => new Promise((res) => {
+    const s = { end: Date.now() + ms, res };
+    s.t = setTimeout(() => { sleepers.delete(s); res(); }, ms);
+    sleepers.add(s);
+  });
+
+  let tickPort = null, tickWanted = false, lastTick = 0;
+  function startTicker() {
+    tickWanted = true;
+    if (tickPort) return;
+    try {
+      tickPort = chrome.runtime.connect({ name: 'ticker' });
+      tickPort.onMessage.addListener(() => {
+        lastTick = Date.now();
+        wakeSleepers();
+        try { tickPort && tickPort.postMessage('pong'); } catch { /* ignore */ }
+      });
+      tickPort.onDisconnect.addListener(() => {
+        tickPort = null;
+        // фоновая часть могла уснуть — переподключаемся, пока идёт очередь
+        if (tickWanted) setTimeout(startTicker, 200);
+      });
+    } catch { tickPort = null; }
+  }
+  function stopTicker() {
+    tickWanted = false;
+    if (tickPort) { try { tickPort.disconnect(); } catch { /* ignore */ } tickPort = null; }
+  }
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const srcOf = (img) => img.currentSrc || img.src || '';
+
+  // ─── Состояние ───
+  const DEFAULTS = {
+    text: '', sep: 'line', prefix: '',
+    delayMin: 5, delayMax: 10,
+    waitImage: true, download: true, folder: 'ChatGPT_Images',
+    retries: 1, timeoutMin: 10, startFrom: 1, names: [], refs: [], wordRows: [], commonMode: 'first', debug: true,
+    editPrompt: `Edit this image using targeted inpainting — do NOT re-render or redraw the scene. Treat the image as a fixed plate: only the regions listed under REMOVE may change; every other pixel must stay as close to the original as possible.
+
+REMOVE completely (fill every freed area with the plain black background — never with new objects or texture):
+1. All text of any kind and in any language: titles, subtitles, headlines, labels, captions, numbers, units, formulas, single letters and symbols next to arrows or objects (e.g. "v", "v₁", "9 м/с"), legends, watermarks and logos (including the "Beyim" logo).
+2. Every UI / infographic layer that carries text: callout boxes, label chips, rounded-rectangle panels, side cards, info bars, badges, frames, and any mini-diagrams or icons inside them — together with the short ticks or leader lines that attach them to the scene.
+3. Flat background decoration: overlay grids, dot patterns, technical or polar grids, gradients, vignettes, noise and texture.
+4. Decorative out-of-focus shapes: bokeh circles, blurred planets or spheres, lens flares and light leaks near the edges and corners of the frame.
+
+BACKGROUND: pure solid black #000000 (RGB 0,0,0) from edge to edge — no colour tint anywhere (no blue, teal, violet or grey haze) and no gradient. A soft glow is allowed only as light naturally emitted by the kept objects, tight around them and fading to pure black.
+
+KEEP exactly as it is — same position, size, shape, colour, lighting, perspective and camera angle:
+- every main object and character with all its details, materials and shading;
+- every arrow, vector, trajectory, arc, dashed or guide line and arrowhead — only their text labels are removed;
+- lines that belong to the scene itself (grid lines drawn on objects, floor / road / track / water perspective lines) and the shadows or reflections the objects cast;
+- the overall composition, framing, aspect ratio and resolution.
+
+DO NOT: add any new element, text or decoration; move, resize, restyle, recolour or blur any kept element; crop or zoom; leave empty frames, outlines, smudges or ghost remnants where removed items used to be.
+
+RESULT: the same scene, isolated on a clean pure black background — only the objects, their lines and arrows, shadows and native glow — ready for compositing with the Screen blend mode. Clean edges, no dark halo or grey fringe around objects.`,
+    editSuffix: '_black', followUp: false, editOpen: false,
+    open: true, settingsOpen: false, logOpen: true, pos: null,
+  };
+  let S = { ...DEFAULTS };
+  const run = { active: false, paused: false, stop: false };
+  const STORE_KEY = 'cgptBatch';
+
+  // После обновления/перезагрузки расширения старая копия скрипта теряет доступ к chrome.*.
+  // В этом случае она тихо выключается (новая копия уже подключена к вкладке).
+  const extAlive = () => { try { return !!(chrome.runtime && chrome.runtime.id && chrome.storage); } catch { return false; } };
+  let retired = false;
+  function retire() {
+    if (retired) return;
+    retired = true;
+    run.stop = true;
+    tickWanted = false;
+    const h = document.getElementById('cgpt-batch-host');
+    if (h && h.shadowRoot === shadowRef) h.remove();
+  }
+  let shadowRef = null;
+
+  const save = () => {
+    if (!extAlive()) { retire(); return; }
+    try { chrome.storage.local.set({ [STORE_KEY]: S }).catch(() => {}); } catch { retire(); }
+  };
+  const load = async () => {
+    try {
+      const data = await chrome.storage.local.get(STORE_KEY);
+      S = { ...DEFAULTS, ...(data[STORE_KEY] || {}) };
+      // Старый короткий шаблон доработки (если пользователь его не менял) → новый
+      if ((S.editPrompt || '').startsWith('Edit this image. Remove ALL text: headlines')) S.editPrompt = DEFAULTS.editPrompt;
+    } catch { S = { ...DEFAULTS }; }
+  };
+
+  // Время последнего изменения страницы — чтобы понять, что ответ «успокоился»
+  let lastMut = Date.now();
+  new MutationObserver(() => { lastMut = Date.now(); }).observe(document.documentElement, {
+    subtree: true, childList: true, characterData: true,
+    attributes: true, attributeFilter: ['src', 'data-testid', 'aria-label'],
+  });
+
+  // ─── Разбор промптов ───
+  function parsePrompts(text, sep) {
+    let parts;
+    if (sep === 'blank') parts = text.split(/\r?\n\s*\r?\n/);
+    else if (sep === 'dash') parts = text.split(/^\s*-{3,}\s*$/m);
+    else parts = text.split(/\r?\n/);
+    return parts.map((s) => s.trim()).filter(Boolean);
+  }
+
+  function parseCSV(text) {
+    const firstLine = text.split(/\r?\n/)[0] || '';
+    const delim = firstLine.includes(';') && !firstLine.includes(',') ? ';' : (firstLine.includes('\t') ? '\t' : ',');
+    const rows = []; let row = [], cur = '', q = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (q) {
+        if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; }
+        else cur += c;
+      } else if (c === '"') q = true;
+      else if (c === delim) { row.push(cur); cur = ''; }
+      else if (c === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; }
+      else if (c !== '\r') cur += c;
+    }
+    row.push(cur); rows.push(row);
+    const data = rows.filter((r) => r.some((c) => c.trim()));
+    if (!data.length) return { prompts: [], names: [], refs: [], rows: [] };
+
+    // Заголовок: ищем колонку с промптом и (необязательно) с именем файла
+    const head = data[0].map((c) => c.trim().toLowerCase());
+    let pCol = head.findIndex((h) => /^(prompt|prompts|промпт|промпты|запрос)$/.test(h));
+    const nCol = head.findIndex((h) => /^(имя_результата|имя_файла|filename|file_name|name|имя)$/.test(h));
+    const rCol = head.findIndex((h) => /^(реф_файл|реф|референс|ref|reference|ref_file|image|картинка)$/.test(h));
+    const wCol = head.findIndex((h) => /^(строка_в_word|строка_word|строка|word_row|row)$/.test(h));
+    const hasHeader = pCol >= 0 || nCol >= 0 || rCol >= 0 || wCol >= 0;
+    const body = hasHeader ? data.slice(1) : data;
+    if (pCol < 0) {
+      // Нет заголовка «prompt» — берём колонку с самым длинным текстом
+      const width = Math.max(...body.map((r) => r.length));
+      let best = 0, bestLen = -1;
+      for (let c = 0; c < width; c++) {
+        const len = body.reduce((s, r) => s + (r[c] || '').length, 0);
+        if (len > bestLen) { bestLen = len; best = c; }
+      }
+      pCol = best;
+    }
+    const prompts = [], names = [], refs = [], wrows = [];
+    for (const r of body) {
+      const p = (r[pCol] || '').trim();
+      if (!p) continue;
+      prompts.push(p);
+      names.push(nCol >= 0 ? (r[nCol] || '').trim() : '');
+      refs.push(rCol >= 0 ? (r[rCol] || '').trim() : '');
+      wrows.push(wCol >= 0 ? (r[wCol] || '').trim() : '');
+    }
+    return { prompts, names, refs, rows: wrows };
+  }
+
+  // ─── Работа со страницей ChatGPT ───
+  const isGenerating = () => !!$(SEL.stop);
+  const countTurns = () => Math.max($$(SEL.turn).length, $$(SEL.msg).length);
+
+  function allImgs() {
+    const root = $('main') || document.body;
+    const composer = composerRoot();
+    return $$('img', root).filter((i) => {
+      const s = srcOf(i);
+      if (!s || s.startsWith('data:image/svg')) return false;
+      // не считаем картинки из поля ввода (превью вложений) и из сообщений пользователя (референсы)
+      if (composer && composer.contains(i)) return false;
+      if (i.closest('[data-message-author-role="user"], [data-turn="user"]')) return false;
+      const turn = i.closest(SEL.turn);
+      if (turn && turn.querySelector('[data-message-author-role="user"]') && !turn.querySelector('[data-message-author-role="assistant"]')) return false;
+      return true;
+    });
+  }
+
+  // Новые картинки (которых не было до отправки), без дублей по src
+  function newImages(before) {
+    const seen = new Set();
+    return allImgs().filter((i) => {
+      const s = srcOf(i);
+      if (before.has(s) || seen.has(s)) return false;
+      if (i.complete && i.naturalWidth && i.naturalWidth < MIN_IMG_SIZE) return false;
+      // В фоновой вкладке «ленивые» картинки могут не грузиться — заставляем
+      if (i.loading === 'lazy') i.loading = 'eager';
+      seen.add(s);
+      return true;
+    });
+  }
+  const imgReady = (i) => i.complete && i.naturalWidth >= MIN_IMG_SIZE;
+  const hasRealSrc = (i) => /^(https?:|blob:|data:image\/(?!svg))/.test(srcOf(i));
+  const isBlurred = (i) => /blur\(/.test(getComputedStyle(i).filter);
+  // Картинку можно скачивать: она загрузилась, либо вкладка скрыта и у картинки
+  // уже есть настоящая ссылка (скачивание идёт по ссылке, отрисовка не нужна)
+  const imgUsable = (i) => imgReady(i) || (document.hidden && hasRealSrc(i) && !isBlurred(i));
+
+  function lastTurnText() {
+    const turns = $$(SEL.turn);
+    const el = turns[turns.length - 1] || $$(SEL.msg).pop();
+    return el ? el.innerText : '';
+  }
+
+  function imagePending(before) {
+    if (IMAGE_PENDING_RE.test(lastTurnText())) return true;
+    // размытая заготовка / ещё грузящаяся картинка
+    return newImages(before).some((i) => !imgUsable(i) || isBlurred(i));
+  }
+
+  function checkStop() { if (run.stop) throw new Error('STOP'); }
+  async function waitPause() { while (run.paused) { checkStop(); await sleep(300); } }
+  async function sleepChecked(ms, onTick) {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      checkStop();
+      onTick && onTick(Math.ceil((end - Date.now()) / 1000));
+      await sleep(Math.min(250, end - Date.now()));
+    }
+  }
+
+  // ─── Поиск элементов: только ВИДИМЫЕ (в ChatGPT есть скрытый запасной textarea) ───
+  function isVisible(el) {
+    if (!el || !el.isConnected) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden' && +cs.opacity !== 0;
+  }
+  function inputCandidates() {
+    const seen = new Set();
+    return SEL.inputList.flatMap((s) => $$(s)).filter((el) => !seen.has(el) && seen.add(el));
+  }
+  const findInput = () => inputCandidates().find(isVisible) || null;
+  const inputText = (el) => (el ? (el.tagName === 'TEXTAREA' ? el.value : el.innerText) : '');
+
+  function sendCandidates() {
+    const seen = new Set();
+    return SEL.sendList.flatMap((s) => $$(s))
+      .filter((b) => !seen.has(b) && seen.add(b))
+      .filter((b) => b.getAttribute('data-testid') !== 'stop-button');
+  }
+  const findSend = () => sendCandidates().find((b) => isVisible(b) && !b.disabled && b.getAttribute('aria-disabled') !== 'true') || null;
+
+  // Текст в поле совпадает с промптом (с допуском на пробелы/переносы)
+  function textMatches(el, text) {
+    const a = norm(inputText(el)), b = norm(text);
+    if (!a) return false;
+    return a === b || (a.length >= b.length * 0.95 && a.includes(b.slice(0, 60)) && a.includes(b.slice(-40)));
+  }
+
+  function clearInput(el) {
+    el.focus();
+    if (el.tagName === 'TEXTAREA') { setTextareaValue(el, ''); return; }
+    const sel = getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    sel.removeAllRanges(); sel.addRange(range);
+    document.execCommand('delete', false);
+  }
+  function setTextareaValue(el, v) {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(el, v);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  const escapeHtml = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  // Способы вставки — пробуем по очереди, после каждого проверяем результат
+  const INSERT_METHODS = [
+    ['paste', async (el, text) => {
+      const dt = new DataTransfer();
+      dt.setData('text/plain', text);
+      el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    }],
+    ['insertText', async (el, text) => {
+      if (el.tagName === 'TEXTAREA') { setTextareaValue(el, text); return; }
+      document.execCommand('insertText', false, text);
+    }],
+    ['beforeinput', async (el, text) => {
+      const dt = new DataTransfer();
+      dt.setData('text/plain', text);
+      el.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertFromPaste', dataTransfer: dt, bubbles: true, cancelable: true }));
+    }],
+    ['dom', async (el, text) => {
+      if (el.tagName === 'TEXTAREA') { setTextareaValue(el, text); return; }
+      el.innerHTML = text.split(/\r?\n/).map((l) => `<p>${l ? escapeHtml(l) : '<br>'}</p>`).join('');
+      el.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: text, bubbles: true }));
+    }],
+  ];
+
+  async function typePrompt(text) {
+    const el = findInput();
+    if (!el) {
+      dbg('Поле ввода не найдено', diag());
+      throw new Error('Не найдено видимое поле ввода ChatGPT');
+    }
+    for (const [name, fn] of INSERT_METHODS) {
+      clearInput(el);
+      await sleep(150);
+      el.focus();
+      try { await fn(el, text); } catch (e) { dbg(`Вставка «${name}» упала: ${e.message}`); }
+      await sleep(500);
+      if (textMatches(el, text)) {
+        dbg(`Текст вставлен способом «${name}» (${inputText(el).length} симв.) в ${desc(el)}`);
+        return el;
+      }
+      dbg(`Способ «${name}» не сработал: в поле ${norm(inputText(el)).length} симв. из ${norm(text).length}`);
+    }
+    dbg('Ни один способ вставки не сработал', diag());
+    throw new Error('Не удалось вставить текст в поле ввода');
+  }
+
+  // Отправка уже произошла? (поле очистилось / пошла генерация / появилось новое сообщение)
+  const sentOk = (el, turnsBefore) => isGenerating() || countTurns() > turnsBefore || !norm(inputText(el));
+
+  async function clickSend(el, turnsBefore, waitMs = 10000) {
+    // 1) ждём активную кнопку «Отправить» (с файлами — дольше: пока идёт загрузка, она неактивна)
+    const t0 = Date.now();
+    let btn = null;
+    while (Date.now() - t0 < waitMs) {
+      checkStop();
+      btn = findSend();
+      if (btn) break;
+      if (waitMs > 10000) setStatus('gen', `Загрузка файлов… ${Math.round((Date.now() - t0) / 1000)} с`);
+      await sleep(300);
+    }
+    const tries = [];
+    if (btn) tries.push(['кнопка', () => btn.click()]);
+    else dbg(`Кнопка «Отправить» не найдена за ${Math.round(waitMs / 1000)} с`, diag());
+    tries.push(['Enter', () => {
+      el.focus();
+      const o = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+      el.dispatchEvent(new KeyboardEvent('keydown', o));
+      el.dispatchEvent(new KeyboardEvent('keypress', o));
+      el.dispatchEvent(new KeyboardEvent('keyup', o));
+    }]);
+    tries.push(['form.submit', () => {
+      const form = el.closest('form');
+      if (form && form.requestSubmit) form.requestSubmit(); else throw new Error('нет формы');
+    }]);
+
+    // 2) пробуем способы, пока отправка не подтвердится
+    for (const [name, fn] of tries) {
+      try { fn(); } catch (e) { dbg(`Отправка «${name}» упала: ${e.message}`); continue; }
+      const t1 = Date.now();
+      while (Date.now() - t1 < 4000) {
+        if (sentOk(el, turnsBefore)) { dbg(`Отправлено способом «${name}»`); return true; }
+        await sleep(200);
+      }
+      dbg(`Отправка «${name}» не подтвердилась`);
+    }
+    dbg('Не удалось отправить', diag());
+    return false;
+  }
+
+  // ─── Прикрепление файлов ───
+  // Файлы живут только в памяти вкладки: после перезагрузки страницы их нужно выбрать заново.
+  // refSource: 'folder' — референсы из папки, 'word' — картинки из таблицы Word-ТЗ
+  const files = { common: [], refs: new Map(), edit: [], word: [], wordName: '', refSource: '' };
+  const baseName = (n) => (n || '').split(/[\\/]/).pop().toLowerCase();
+  const stripExt = (n) => n.replace(/\.[a-z0-9]{2,5}$/i, '');
+  const isImageFile = (f) => /^image\//.test(f.type) || /\.(png|jpe?g|webp|gif)$/i.test(f.name);
+
+  // ─── Word-ТЗ (.docx): достаём картинки из строк таблицы ───
+  // .docx — это zip. Распаковываем встроенным DecompressionStream, без библиотек.
+  async function unzip(file) {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    const dv = new DataView(buf.buffer);
+    let eocd = -1;
+    for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i--) {
+      if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) throw new Error('файл не похож на .docx');
+    const count = dv.getUint16(eocd + 10, true);
+    let p = dv.getUint32(eocd + 16, true);
+    const entries = {};
+    const dec = new TextDecoder();
+    for (let k = 0; k < count && dv.getUint32(p, true) === 0x02014b50; k++) {
+      const method = dv.getUint16(p + 10, true), csize = dv.getUint32(p + 20, true);
+      const nlen = dv.getUint16(p + 28, true), elen = dv.getUint16(p + 30, true), clen = dv.getUint16(p + 32, true);
+      const off = dv.getUint32(p + 42, true);
+      entries[dec.decode(buf.subarray(p + 46, p + 46 + nlen))] = { method, csize, off };
+      p += 46 + nlen + elen + clen;
+    }
+    const read = async (name) => {
+      const e = entries[name];
+      if (!e) return null;
+      const start = e.off + 30 + dv.getUint16(e.off + 26, true) + dv.getUint16(e.off + 28, true);
+      const data = buf.subarray(start, start + e.csize);
+      if (e.method === 0) return data;
+      const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    };
+    return { read };
+  }
+
+  const xmlUnescape = (s) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+  const cellText = (xml) => xml.split(/<\/w:p>/).map((p) =>
+    xmlUnescape([...p.matchAll(/<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g)].map((m) => m[1]).join(''))).filter((t) => t.trim()).join('\n');
+  const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
+
+  // Строки таблиц, в которых есть картинка → [{ label, title, desc, file }]
+  async function parseWordTZ(docx) {
+    const z = await unzip(docx);
+    const dec = new TextDecoder();
+    const docXml = await z.read('word/document.xml');
+    if (!docXml) throw new Error('в файле нет word/document.xml');
+    const xml = dec.decode(docXml);
+    const relsRaw = await z.read('word/_rels/document.xml.rels');
+    const rels = {};
+    for (const m of dec.decode(relsRaw || new Uint8Array()).matchAll(/<Relationship\b[^>]*>/g)) {
+      const id = (m[0].match(/\bId="([^"]+)"/) || [])[1];
+      const target = (m[0].match(/\bTarget="([^"]+)"/) || [])[1];
+      if (id && target) rels[id] = target.startsWith('/') ? target.slice(1) : 'word/' + target;
+    }
+    const out = [];
+    for (const row of xml.matchAll(/<w:tr[\s>][\s\S]*?<\/w:tr>/g)) {
+      const cells = [...row[0].matchAll(/<w:tc\b[^>]*>([\s\S]*?)<\/w:tc>/g)].map((c) => c[1]);
+      const ids = [...row[0].matchAll(/r:(?:embed|id)="(rId\d+)"/g)].map((m) => m[1]).filter((id) => /\.(png|jpe?g|gif|webp)$/i.test(rels[id] || ''));
+      if (!ids.length) continue;
+      const texts = cells.map(cellText);
+      const imgCell = cells.findIndex((c) => /r:(?:embed|id)="rId\d+"/.test(c));
+      const path = rels[ids[0]];
+      const bytes = await z.read(path);
+      if (!bytes) continue;
+      const ext = path.split('.').pop().toLowerCase();
+      const label = (texts[0] || '').trim() || `Строка ${out.length + 1}`;
+      const file = new File([bytes], `${String(out.length + 1).padStart(2, '0')}_${slug(label)}.${ext}`, { type: MIME[ext] || 'image/png' });
+      out.push({ label, title: (texts[1] || '').trim(), desc: (texts[imgCell] || texts[texts.length - 1] || '').trim(), file });
+    }
+    return out;
+  }
+
+  // Какая строка Word нужна промпту №i:
+  // 1) колонка «строка_в_Word» из CSV → 2) «Слайд 1» / «Рисунок 2» в тексте промпта → 3) по порядку
+  const labelKey = (s) => norm(s).toLowerCase().replace(/ё/g, 'е');
+  const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  function wordRowFor(i) {
+    const rows = files.word;
+    if (!rows.length) return null;
+    const prompts = parsePrompts(S.text, S.sep);
+    const col = S.wordRows && S.wordRows.length === prompts.length ? S.wordRows[i] : '';
+    if (col) {
+      const r = rows.find((x) => labelKey(x.label) === labelKey(col));
+      if (r) return { row: r, how: 'колонка «строка_в_Word»' };
+    }
+    const t = labelKey(prompts[i] || '');
+    let loose = null;
+    for (const r of rows) {
+      const L = labelKey(r.label);
+      if (!L) continue;
+      if (t.includes(`«${L}»`) || t.includes(`"${L}"`)) return { row: r, how: 'упоминание в промпте' };
+      if (!loose && new RegExp(`(^|[^\\p{L}\\p{N}])${escRe(L)}(?!\\p{N})`, 'u').test(t)) loose = r;
+    }
+    if (loose) return { row: loose, how: 'упоминание в промпте' };
+    return rows[i] ? { row: rows[i], how: 'по порядку' } : null;
+  }
+
+  // Референс для промпта №i: по колонке «реф_файл», иначе по номеру в начале имени (01_…, 1_…)
+  function refFor(i) {
+    if (files.refSource === 'word') { const w = wordRowFor(i); return w ? w.row.file : null; }
+    // Колонка из CSV действует, только пока список промптов тот же, что был загружен
+    const refsValid = S.refs && S.refs.length && S.refs.length === parsePrompts(S.text, S.sep).length;
+    const want = refsValid && S.refs[i];
+    if (want) {
+      const b = baseName(want);
+      return files.refs.get(b) || files.refs.get(stripExt(b)) || null;
+    }
+    const num = i + 1;
+    for (const [name, f] of files.refs) {
+      const m = name.match(/^0*(\d+)[\s._-]/);
+      if (m && +m[1] === num) return f;
+    }
+    return null;
+  }
+  function attachmentsFor(i, isFirstOfRun) {
+    const list = [];
+    if (files.common.length && (S.commonMode === 'each' || isFirstOfRun)) list.push(...files.common);
+    const r = refFor(i);
+    if (r) list.push(r);
+    else if (files.refSource === 'folder' && S.refs && S.refs[i] && files.refs.size) log(`#${i + 1}: референс «${S.refs[i]}» не найден в выбранной папке`, 'warn');
+    else if (files.refSource === 'word') log(`#${i + 1}: подходящей строки в Word не нашлось — без референса`, 'warn');
+    return list;
+  }
+
+  // Область с полем ввода и превью вложений
+  function composerRoot() {
+    const el = findInput();
+    if (!el) return null;
+    return el.closest('form') || el.closest('[class*="composer"]') || el.parentElement?.parentElement?.parentElement || null;
+  }
+  function composerSnapshot() {
+    const root = composerRoot();
+    if (!root) return { imgs: 0, text: '' };
+    const ed = findInput();
+    const imgs = $$('img', root).filter((i) => !ed || !ed.contains(i)).length;
+    return { imgs, text: (root.innerText || '').toLowerCase() };
+  }
+  // Файл появился среди вложений? Картинка — новое превью, документ — его имя в поле
+  function fileAppeared(file, before) {
+    const now = composerSnapshot();
+    if (isImageFile(file)) return now.imgs > before.imgs;
+    const stem = stripExt(file.name.toLowerCase()).slice(0, 18);
+    return now.text.includes(stem) && !before.text.includes(stem);
+  }
+
+  function fileInputsFor(file) {
+    const all = $$('input[type="file"]');
+    const score = (inp) => {
+      const acc = (inp.getAttribute('accept') || '').toLowerCase();
+      if (!acc) return 2;
+      const ext = '.' + file.name.split('.').pop().toLowerCase();
+      if (acc.includes(ext) || (file.type && acc.includes(file.type))) return 3;
+      if (isImageFile(file) && acc.includes('image')) return 3;
+      if (!isImageFile(file) && /^image\/?\*?(,\s*image\/[^,]+)*$/.test(acc)) return -1; // только картинки
+      return 1;
+    };
+    return all.map((inp) => [inp, score(inp)]).filter(([, s]) => s >= 0).sort((a, b) => b[1] - a[1]).map(([inp]) => inp);
+  }
+
+  const ATTACH_METHODS = [
+    ['input', async (file) => {
+      const inputs = fileInputsFor(file);
+      if (!inputs.length) throw new Error('нет input[type=file]');
+      const dt = new DataTransfer(); dt.items.add(file);
+      inputs[0].files = dt.files;
+      inputs[0].dispatchEvent(new Event('input', { bubbles: true }));
+      inputs[0].dispatchEvent(new Event('change', { bubbles: true }));
+    }],
+    ['paste', async (file) => {
+      const el = findInput(); el.focus();
+      const dt = new DataTransfer(); dt.items.add(file);
+      el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    }],
+    ['drop', async (file) => {
+      const target = composerRoot() || findInput();
+      const dt = new DataTransfer(); dt.items.add(file);
+      for (const type of ['dragenter', 'dragover', 'drop']) {
+        target.dispatchEvent(new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true }));
+        await sleep(80);
+      }
+    }],
+  ];
+
+  async function attachFiles(list) {
+    for (const file of list) {
+      let ok = false;
+      for (const [name, fn] of ATTACH_METHODS) {
+        checkStop();
+        const before = composerSnapshot();
+        try { await fn(file); } catch (e) { dbg(`Прикрепление «${file.name}» способом «${name}» упало: ${e.message}`); continue; }
+        const t0 = Date.now();
+        while (Date.now() - t0 < 6000) {
+          if (fileAppeared(file, before)) { ok = true; break; }
+          await sleep(250);
+        }
+        if (ok) { dbg(`Файл «${file.name}» прикреплён способом «${name}»`); break; }
+        dbg(`Способ «${name}» для «${file.name}» не подтвердился`);
+      }
+      if (!ok) {
+        dbg(`Не удалось прикрепить «${file.name}»`, diag());
+        throw new Error(`не удалось прикрепить файл «${file.name}»`);
+      }
+      await sleep(400);
+    }
+  }
+
+  // ─── Диагностика ───
+  function desc(el) {
+    if (!el) return '—';
+    let s = el.tagName.toLowerCase();
+    if (el.id) s += '#' + el.id;
+    const tid = el.getAttribute('data-testid'); if (tid) s += `[testid=${tid}]`;
+    const al = el.getAttribute('aria-label'); if (al) s += `[aria=${al}]`;
+    if (el.getAttribute('contenteditable')) s += `[ce=${el.getAttribute('contenteditable')}]`;
+    s += isVisible(el) ? ' видим' : ' СКРЫТ';
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') s += ' disabled';
+    return s;
+  }
+  function diag() {
+    const inp = findInput();
+    return {
+      url: location.href,
+      visibility: document.visibilityState,
+      focus: document.hasFocus(),
+      input: desc(inp),
+      inputTextLen: norm(inputText(inp)).length,
+      fileInputs: $$('input[type="file"]').map((f) => f.getAttribute('accept') || '*'),
+      attachments: { common: files.common.map((f) => f.name), refs: new Set(files.refs.values()).size },
+      composer: composerSnapshot().imgs + ' img',
+      inputCandidates: inputCandidates().map(desc),
+      send: desc(findSend()),
+      sendCandidates: sendCandidates().map(desc),
+      composerButtons: (() => {
+        const form = inp && (inp.closest('form') || inp.closest('[class*="composer"]'));
+        return form ? $$('button', form).filter(isVisible).map(desc).slice(0, 12) : [];
+      })(),
+      stop: desc($(SEL.stop)),
+      generating: isGenerating(),
+      turns: countTurns(),
+      imgs: allImgs().length,
+      ua: navigator.userAgent.replace(/^.*(Chrome\/[\d.]+).*$/, '$1'),
+    };
+  }
+
+  // Проверка без отправки: вставить тестовый текст и стереть
+  async function testInput() {
+    log('Проверка поля ввода…', 'info');
+    const d = diag();
+    dbg('Состояние страницы', d);
+    const el = findInput();
+    if (!el) { log('✗ Видимое поле ввода не найдено', 'err'); return; }
+    const sample = 'Тест Batch Prompter\nвторая строка';
+    let ok = false;
+    try { await typePrompt(sample); ok = true; } catch (e) { log(`✗ ${e.message}`, 'err'); }
+    if (ok) {
+      await sleep(300);
+      const btn = findSend();
+      log(btn ? `✓ Текст вставляется, кнопка «Отправить» найдена: ${desc(btn)}` : '⚠ Текст вставился, но кнопка «Отправить» не найдена (сработает Enter)', btn ? 'ok' : 'warn');
+      await sleep(800);
+      clearInput(el);
+    }
+    log('Нажмите «Копировать отчёт» и пришлите его, если что-то не так', 'info');
+  }
+
+  async function waitIdle() {
+    const t0 = Date.now();
+    while (isGenerating() && Date.now() - t0 < S.timeoutMin * 60000) { checkStop(); await sleep(1000); }
+  }
+
+  async function waitDone(before, turnsBefore) {
+    const t0 = Date.now();
+    const timeout = Math.max(1, +S.timeoutMin) * 60000;
+
+    // 1) Дождаться начала генерации
+    let started = false;
+    while (Date.now() - t0 < 30000) {
+      checkStop();
+      if (isGenerating() || countTurns() > turnsBefore) { started = true; break; }
+      await sleep(500);
+    }
+    if (!started) { dbg('Генерация не началась за 30 с', diag()); return { ok: false, reason: 'генерация не началась' }; }
+    dbg(`Генерация началась (stop-кнопка: ${isGenerating() ? 'есть' : 'нет'}, сообщений ${countTurns()})`);
+
+    // 2) Дождаться окончания
+    let idleSince = 0, lastReport = 0;
+    while (true) {
+      checkStop();
+      const elapsed = Math.round((Date.now() - t0) / 1000);
+      setStatus('gen', `Генерация… ${fmtTime(elapsed)}`);
+      if (Date.now() - lastReport > 30000) {
+        lastReport = Date.now();
+        const imgs = newImages(before);
+        dbg(`…${fmtTime(elapsed)}: stop=${isGenerating()}, новых картинок ${imgs.length} (готовых ${imgs.filter(imgReady).length}), тишина ${Math.round((Date.now() - lastMut) / 1000)} с, вкладка ${document.visibilityState}, тик ${lastTick ? Math.round((Date.now() - lastTick) / 1000) + ' с назад' : 'нет'}`);
+      }
+      if (Date.now() - t0 > timeout) { dbg('Таймаут', diag()); return { ok: false, reason: 'таймаут' }; }
+      if (isGenerating()) { idleSince = 0; await sleep(1000); continue; }
+      if (!idleSince) idleSince = Date.now();
+      const quietMs = Date.now() - lastMut;
+
+      if (!S.waitImage) {
+        if (quietMs > 2500) break;
+      } else {
+        const imgs = newImages(before);
+        const pending = imagePending(before);
+        if (imgs.some(imgUsable) && !pending && quietMs > 4000) break;
+        // Картинки нет и ничего не происходит 30 с — скорее всего, её и не будет
+        if (!imgs.length && !pending && Date.now() - idleSince > 30000 && quietMs > 10000) break;
+      }
+      await sleep(1000);
+    }
+    return { ok: true };
+  }
+
+  // ─── Скачивание ───
+  const slug = (s) => norm(s).replace(/[^\p{L}\p{N}]+/gu, '_').replace(/^_+|_+$/g, '').slice(0, 50) || 'image';
+  const safeFolder = (s) => (s || '').replace(/[<>:"|?*\x00-\x1f]/g, '').replace(/\\/g, '/')
+    .split('/').map((p) => p.trim().replace(/^\.+|\.+$/g, '')).filter(Boolean).join('/');
+
+  async function blobToDataURL(url) {
+    const blob = await (await fetch(url)).blob();
+    return new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(blob);
+    });
+  }
+
+  async function downloadImgs(imgs, num, prompt, baseName) {
+    const folder = safeFolder(S.folder);
+    let k = 0, saved = 0;
+    for (const img of imgs) {
+      k++;
+      let url = srcOf(img);
+      try {
+        if (url.startsWith('blob:')) url = await blobToDataURL(url);
+        const base = baseName
+          ? baseName.replace(/\.[a-z0-9]{2,4}$/i, '').replace(/[<>:"\/\\|?*\x00-\x1f]/g, '_')
+          : `${String(num).padStart(3, '0')}_${slug(prompt)}`;
+        const name = `${base}${imgs.length > 1 ? '_' + k : ''}.png`;
+        const res = await chrome.runtime.sendMessage({
+          type: 'download', url, filename: folder ? `${folder}/${name}` : name,
+        });
+        if (res && res.ok) saved++;
+        else log(`Не скачалось: ${res && res.error}`, 'err');
+      } catch (e) {
+        log(`Ошибка скачивания: ${e.message}`, 'err');
+      }
+    }
+    return saved;
+  }
+
+  const fmtTime = (sec) => (sec >= 60 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}` : `${sec} с`);
+
+  // ─── Основной цикл ───
+  const pad3 = (n) => String(n).padStart(3, '0');
+  const stemOf = (name) => (name || '').replace(/\.[a-z0-9]{2,5}$/i, '');
+
+  // Одна отправка с повторами: прикрепить → вставить → отправить → дождаться → скачать.
+  // job: { num, label, text, attach: () => File[], name }
+  async function runJob(job) {
+    for (let attempt = 0; attempt <= S.retries; attempt++) {
+      if (attempt > 0) {
+        log(`${job.label}: повтор ${attempt} из ${S.retries}`, 'warn');
+        await sleepChecked(5000, (s) => setStatus('wait', `Повтор через ${s} с`));
+      }
+      setStatus('gen', 'Ждём, пока ChatGPT освободится');
+      await waitIdle();
+      const before = new Set(allImgs().map(srcOf));
+      const turns = countTurns();
+
+      const att = job.attach ? job.attach() : [];
+      const inp = findInput();
+      if (inp) clearInput(inp);
+      if (att.length) {
+        setStatus('gen', `Прикрепляю файлы (${att.length})`);
+        try { await attachFiles(att); } catch (e) {
+          if (e.message === 'STOP') throw e;
+          log(`${job.label}: ${e.message}`, 'err'); continue;
+        }
+        log(`${job.label}: прикреплено — ${att.map((f) => f.name).join(', ')}`, 'info');
+      }
+
+      setStatus('gen', 'Вставка промпта');
+      let el;
+      try { el = await typePrompt(job.text); } catch (e) {
+        if (e.message === 'STOP') throw e;
+        log(`${job.label}: ${e.message}`, 'err'); continue;
+      }
+      setStatus('gen', 'Отправка');
+      if (!(await clickSend(el, turns, att.length ? 180000 : 10000))) { log(`${job.label}: не удалось нажать «Отправить»`, 'err'); continue; }
+      log(`${job.label} отправлен`, 'info');
+
+      const r = await waitDone(before, turns);
+      if (!r.ok) { log(`${job.label}: ${r.reason}`, 'err'); continue; }
+
+      if (!S.waitImage) { log(`${job.label} готово`, 'ok'); return { ok: true, imgs: 0 }; }
+      const imgs = newImages(before).filter(imgUsable);
+      if (!imgs.length) { log(`${job.label}: картинка не появилась`, 'err'); continue; }
+      if (S.download) {
+        setStatus('gen', 'Скачивание');
+        const n = await downloadImgs(imgs, job.num, job.text, job.name);
+        log(`${job.label} готово · скачано ${n} из ${imgs.length}${job.name ? ` → ${job.name}.png` : ''}`, 'ok');
+      } else {
+        log(`${job.label} готово · картинок: ${imgs.length}`, 'ok');
+      }
+      return { ok: true, imgs: imgs.length };
+    }
+    return { ok: false, imgs: 0 };
+  }
+
+  // mode: 'prompts' — очередь промптов; 'edit' — доработка готовых картинок из папки
+  async function start(mode = 'prompts') {
+    readForm();
+    const isEdit = mode === 'edit';
+    const editText = (S.editPrompt || '').trim();
+    let jobs = [];
+
+    if (isEdit) {
+      if (!editText) { flash('Заполните универсальный промпт доработки'); return; }
+      if (!files.edit.length) { flash('Сначала выберите папку с картинками'); return; }
+      jobs = files.edit.map((f, i) => ({
+        num: i + 1, label: `✎${i + 1}`, text: editText, display: f.name,
+        attach: () => [f], name: stemOf(f.name) + (S.editSuffix || ''),
+      }));
+    } else {
+      const prompts = parsePrompts(S.text, S.sep);
+      if (!prompts.length) { flash('Добавьте хотя бы один промпт'); return; }
+      const named = S.names.length === prompts.length;
+      jobs = prompts.map((p, i) => ({
+        num: i + 1, label: `#${i + 1}`, display: p,
+        text: (S.prefix.trim() ? S.prefix.trim() + ' ' : '') + p,
+        attach: null, // задаётся ниже — зависит от того, первый ли это промпт запуска
+        name: (named && S.names[i]) ? stemOf(S.names[i]) : `${pad3(i + 1)}_${slug(p)}`,
+      }));
+    }
+    if (!findInput()) { flash('Поле ввода ChatGPT не найдено — нажмите «Проверить поле»'); dbg('Старт: поле не найдено', diag()); return; }
+    dbg('Старт', diag());
+
+    run.active = true; run.paused = false; run.stop = false;
+    startTicker();
+    updateButtons();
+    let i = isEdit ? 0 : Math.min(Math.max(0, (parseInt(S.startFrom, 10) || 1) - 1), jobs.length - 1);
+    const startIdx = i;
+    if (!isEdit) jobs.forEach((j, k) => { j.attach = () => attachmentsFor(k, k === startIdx); });
+    const followUp = !isEdit && S.followUp && editText;
+
+    let okCount = 0, imgCount = 0;
+    const t0 = Date.now();
+    if (isEdit) {
+      log(`Доработка: ${jobs.length} картинок, суффикс «${S.editSuffix || ''}»`, 'info');
+    } else {
+      if (S.refs && S.refs.length === jobs.length && S.refs.some(Boolean) && !files.refs.size) log('В CSV есть колонка референсов, но папка с ними не выбрана — промпты пойдут без референсов', 'warn');
+      if (files.common.length) log(`Общие файлы: ${files.common.map((f) => f.name).join(', ')} — ${S.commonMode === 'each' ? 'к каждому промпту' : 'к первому промпту'}`, 'info');
+      if (followUp) log('После каждой картинки будет отправляться доработка', 'info');
+      log(`Старт: ${jobs.length} промптов, начиная с №${i + 1}`, 'info');
+    }
+
+    try {
+      for (; i < jobs.length; i++) {
+        if (run.paused) { setStatus('paused', 'Пауза'); await waitPause(); }
+        checkStop();
+        const job = jobs[i];
+        setProgress(i, jobs.length);
+        setCurrent(i + 1, job.display);
+
+        const res = await runJob(job);
+        if (!res.ok) {
+          log(`${job.label} не получился. «Продолжить» повторит его`, 'warn');
+          run.paused = true; updateButtons();
+          setStatus('error', 'Ошибка — очередь на паузе');
+          await waitPause();
+          i--; // повторить тот же
+          continue;
+        }
+        imgCount += res.imgs;
+
+        // Доработка только что созданной картинки в том же чате
+        if (followUp) {
+          await sleepChecked(2000, (s) => setStatus('wait', `Доработка через ${s} с`));
+          setCurrent(i + 1, `доработка: ${job.display}`);
+          const fx = await runJob({
+            num: job.num, label: `${job.label} ✎`, text: editText, attach: null,
+            name: job.name + (S.editSuffix || ''),
+          });
+          if (fx.ok) imgCount += fx.imgs;
+          else log(`${job.label}: доработка не получилась — идём дальше`, 'warn');
+        }
+
+        okCount++;
+        if (!isEdit) { S.startFrom = i + 2; save(); syncStartField(); }
+        setProgress(i + 1, jobs.length);
+
+        if (i < jobs.length - 1) {
+          const lo = Math.max(0, +S.delayMin), hi = Math.max(lo, +S.delayMax);
+          const d = Math.round(lo + Math.random() * (hi - lo));
+          if (d > 0) await sleepChecked(d * 1000, (s) => setStatus('wait', `Следующий через ${s} с`));
+        }
+      }
+      const took = fmtTime(Math.round((Date.now() - t0) / 1000));
+      log(`Готово: ${okCount} ${isEdit ? 'картинок доработано' : 'промптов'}${S.waitImage ? `, скачано ${imgCount}` : ''} за ${took}`, 'ok');
+      setStatus('done', isEdit ? 'Доработка завершена' : 'Все промпты выполнены');
+      setCurrent(null);
+      if (!isEdit) { S.startFrom = 1; save(); syncStartField(); }
+    } catch (e) {
+      if (e.message === 'STOP') {
+        log(isEdit ? 'Остановлено' : `Остановлено. Продолжить можно с №${S.startFrom}`, 'warn');
+        setStatus('idle', 'Остановлено');
+      } else { log(`Ошибка: ${e.message}`, 'err'); setStatus('error', 'Ошибка'); }
+    }
+    run.active = false; run.paused = false;
+    stopTicker();
+    updateButtons();
+  }
+
+  // ─── Иконки ───
+  const I = {
+    play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z"/></svg>',
+    pause: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1.2"/><rect x="14" y="5" width="4" height="14" rx="1.2"/></svg>',
+    stop: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
+    wand: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 20 11-11M14 4l1 2 2 1-2 1-1 2-1-2-2-1 2-1zM19 11l.7 1.3L21 13l-1.3.7L19 15l-.7-1.3L17 13l1.3-.7z"/></svg>',
+    doc: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></svg>',
+    img: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m21 16-5-5-9 9"/></svg>',
+    upload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V4M7 9l5-5 5 5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>',
+    trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>',
+    min: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 12h12"/></svg>',
+    chev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>',
+    bolt: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 4.5 13.5H11L10 22l8.5-11.5H12L13 2z"/></svg>',
+    gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',
+  };
+
+  // ─── Панель ───
+  const ui = {};
+  const host = document.createElement('div');
+  host.id = 'cgpt-batch-host';
+  const shadow = host.attachShadow({ mode: 'open' });
+  shadowRef = shadow;
+  // Периодически проверяем, что расширение не перезагрузили под нами
+  const aliveTimer = setInterval(() => { if (!extAlive()) { clearInterval(aliveTimer); retire(); } }, 3000);
+
+  shadow.innerHTML = `
+  <style>
+    :host { all: initial; }
+    .root {
+      --bg: #ffffff; --bg2: #f7f7f8; --bg3: #efeff1; --fg: #0d0d0d; --muted: #6e6e80; --border: #e3e3e8;
+      --accent: #10a37f; --accent-h: #0d8f6f; --accent-soft: rgba(16,163,127,.12);
+      --warn: #d97706; --warn-soft: rgba(217,119,6,.12); --danger: #e5484d; --danger-soft: rgba(229,72,77,.12);
+      --shadow: 0 12px 40px rgba(0,0,0,.14), 0 2px 8px rgba(0,0,0,.06);
+      font: 13px/1.4 ui-sans-serif, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      color: var(--fg); -webkit-font-smoothing: antialiased;
+    }
+    .root.dark {
+      --bg: #212121; --bg2: #2a2a2a; --bg3: #333; --fg: #ececec; --muted: #9b9ba5; --border: #3a3a3d;
+      --accent-soft: rgba(16,163,127,.18); --shadow: 0 16px 48px rgba(0,0,0,.5), 0 2px 8px rgba(0,0,0,.3);
+    }
+    * { box-sizing: border-box; }
+    svg { width: 16px; height: 16px; flex: none; display: block; }
+    button { font: inherit; color: inherit; cursor: pointer; border: 0; background: none; }
+    button:disabled { opacity: .45; cursor: default; }
+    input, textarea { font: inherit; color: var(--fg); }
+
+    .panel { position: fixed; right: 20px; bottom: 20px; width: 384px; max-height: calc(100vh - 40px);
+      display: flex; flex-direction: column; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 18px; box-shadow: var(--shadow); z-index: 2147483647; overflow: hidden; }
+
+    .hdr { display: flex; align-items: center; gap: 10px; padding: 12px 12px 12px 14px; cursor: grab; user-select: none; }
+    .hdr:active { cursor: grabbing; }
+    .logo { width: 28px; height: 28px; border-radius: 9px; background: var(--accent); color: #fff; display: grid; place-items: center; }
+    .title { font-weight: 650; font-size: 14px; flex: 1; letter-spacing: -.01em; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 99px;
+      font-size: 11.5px; font-weight: 600; background: var(--bg3); color: var(--muted); white-space: nowrap; }
+    .pill i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    .pill.gen, .pill.wait { background: var(--accent-soft); color: var(--accent); }
+    .pill.gen i { animation: pulse 1.2s infinite; }
+    .pill.paused { background: var(--warn-soft); color: var(--warn); }
+    .pill.error { background: var(--danger-soft); color: var(--danger); }
+    .pill.done { background: var(--accent-soft); color: var(--accent); }
+    @keyframes pulse { 50% { opacity: .3; } }
+    .icon-btn { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; color: var(--muted); }
+    .icon-btn:hover { background: var(--bg3); color: var(--fg); }
+
+    .body { overflow: auto; padding: 0 14px 14px; display: flex; flex-direction: column; gap: 12px; }
+
+    .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 14px; }
+    .sec-title { font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+
+    /* Промпты */
+    .prompts { padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+    .prompts-top { display: flex; align-items: center; justify-content: space-between; }
+    .count { font-size: 12px; color: var(--muted); }
+    .count b { color: var(--fg); }
+    textarea { width: 100%; height: 132px; resize: vertical; min-height: 80px; padding: 10px 11px;
+      background: var(--bg); border: 1px solid var(--border); border-radius: 10px; outline: none;
+      font-size: 13px; line-height: 1.5; transition: border-color .15s, box-shadow .15s; }
+    textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    textarea.drag { border-color: var(--accent); border-style: dashed; background: var(--accent-soft); }
+    .tools { display: flex; align-items: center; gap: 6px; }
+    .seg { display: inline-flex; background: var(--bg3); border-radius: 8px; padding: 2px; flex: 1; }
+    .seg button { flex: 1; padding: 5px 6px; border-radius: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+    .seg button.on { background: var(--bg); color: var(--fg); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+    .ghost { display: inline-flex; align-items: center; gap: 5px; padding: 6px 9px; border-radius: 8px;
+      font-size: 12px; font-weight: 550; color: var(--fg); border: 1px solid var(--border); background: var(--bg); }
+    .ghost:hover:not(:disabled) { background: var(--bg3); }
+    .ghost svg { width: 14px; height: 14px; }
+    .ghost.sq { padding: 6px; }
+
+    /* Настройки */
+    details { border-radius: 14px; }
+    summary { list-style: none; display: flex; align-items: center; gap: 8px; padding: 10px 12px; cursor: pointer;
+      font-weight: 600; user-select: none; }
+    summary::-webkit-details-marker { display: none; }
+    summary .chev { margin-left: auto; color: var(--muted); transition: transform .2s; }
+    details[open] summary .chev { transform: rotate(90deg); }
+    summary .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
+    .settings { padding: 2px 12px 12px; display: flex; flex-direction: column; gap: 12px; }
+    .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+    .inp { width: 100%; padding: 7px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+      outline: none; font-size: 13px; }
+    .inp:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .range { display: flex; align-items: center; gap: 6px; }
+    .range .inp { text-align: center; }
+    .range span { color: var(--muted); }
+    .grid3 { display: grid; grid-template-columns: 1.6fr 1fr 1fr; gap: 10px; }
+    .num { -moz-appearance: textfield; text-align: center; }
+    .num::-webkit-inner-spin-button, .num::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    .sw-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; cursor: pointer; }
+    .sw-row .t { font-size: 13px; }
+    .sw-row .d { font-size: 11.5px; color: var(--muted); }
+    .sw { position: relative; width: 36px; height: 20px; flex: none; }
+    .sw input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .sw span { position: absolute; inset: 0; background: var(--border); border-radius: 99px; transition: .2s; }
+    .sw span::after { content: ""; position: absolute; left: 2px; top: 2px; width: 16px; height: 16px; border-radius: 50%;
+      background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.25); transition: .2s; }
+    .sw input:checked + span { background: var(--accent); }
+    .sw input:checked + span::after { transform: translateX(16px); }
+    .sw input:disabled + span { opacity: .5; }
+    .divider { height: 1px; background: var(--border); }
+
+    /* Запуск */
+    .runbox { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+    .prog-top { display: flex; align-items: baseline; justify-content: space-between; }
+    .prog-num { font-size: 22px; font-weight: 700; letter-spacing: -.02em; }
+    .prog-num small { font-size: 13px; color: var(--muted); font-weight: 500; }
+    .status { font-size: 12px; color: var(--muted); text-align: right; }
+    .bar { height: 6px; background: var(--bg3); border-radius: 99px; overflow: hidden; }
+    .bar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 99px; transition: width .4s ease; }
+    .current { font-size: 12.5px; color: var(--fg); background: var(--bg); border: 1px solid var(--border);
+      border-radius: 9px; padding: 7px 9px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    .current b { color: var(--accent); }
+    .start-from { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+    .start-from .inp { width: 64px; padding: 5px 8px; text-align: center; }
+    .actions { display: flex; gap: 8px; }
+    .btn { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 7px; height: 40px;
+      border-radius: 11px; font-weight: 600; font-size: 13.5px; transition: background .15s, transform .05s; }
+    .btn:active:not(:disabled) { transform: scale(.98); }
+    .btn.primary { background: var(--accent); color: #fff; }
+    .btn.primary:hover:not(:disabled) { background: var(--accent-h); }
+    .btn.secondary { background: var(--bg3); color: var(--fg); }
+    .btn.secondary:hover:not(:disabled) { background: var(--border); }
+    .btn.danger { background: var(--danger-soft); color: var(--danger); flex: 0 0 auto; padding: 0 14px; }
+    .flash { font-size: 12px; color: var(--danger); min-height: 0; }
+
+    /* Журнал */
+    .log { max-height: 150px; overflow: auto; padding: 0 12px 10px; display: flex; flex-direction: column; gap: 3px;
+      font-size: 12px; }
+    .log .e { display: flex; gap: 8px; line-height: 1.45; }
+    .log .tm { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+    .log .ok .tx { color: var(--accent); }
+    .log .err .tx { color: var(--danger); }
+    .log .warn .tx { color: var(--warn); }
+    .log .empty { color: var(--muted); }
+    .log .dbg .tx { color: var(--muted); font-size: 11.5px; }
+    .files { padding: 10px; display: flex; flex-direction: column; gap: 9px; }
+    .frow { display: flex; align-items: center; gap: 10px; }
+    .fic { width: 30px; height: 30px; border-radius: 8px; background: var(--bg3); color: var(--muted); display: grid; place-items: center; flex: none; }
+    .fic.on { background: var(--accent-soft); color: var(--accent); }
+    .ftxt { flex: 1; min-width: 0; }
+    .ftxt .t { font-size: 13px; font-weight: 550; }
+    .ftxt .d { font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .ftxt .d.ok { color: var(--accent); }
+    .ftxt .d.warn { color: var(--warn); }
+    .seg.small button { font-size: 11.5px; padding: 4px 6px; }
+    .seg.dim { opacity: .45; pointer-events: none; }
+    textarea.small-ta { height: 92px; min-height: 60px; font-size: 12px; line-height: 1.45; padding: 8px 10px; }
+    .logtools { display: flex; align-items: center; gap: 6px; padding: 0 12px 8px; }
+    .logtools .ghost { white-space: nowrap; padding: 6px 8px; }
+    .mini-sw { margin-left: auto; display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); cursor: pointer; }
+    .mini-sw input { accent-color: var(--accent); margin: 0; }
+    .clear-log { margin-left: auto; font-size: 11.5px; color: var(--muted); padding: 2px 6px; border-radius: 6px; font-weight: 500; }
+    .clear-log:hover { background: var(--bg3); color: var(--fg); }
+
+    .fab { position: fixed; right: 20px; bottom: 96px; width: 46px; height: 46px; border-radius: 14px;
+      background: var(--accent); color: #fff; display: grid; place-items: center; z-index: 2147483647;
+      box-shadow: 0 6px 20px rgba(16,163,127,.4); transition: transform .15s; }
+    .fab:hover { transform: translateY(-2px); }
+    .fab svg { width: 20px; height: 20px; }
+    .fab .badge { position: absolute; top: -5px; right: -5px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 99px;
+      background: var(--fg); color: var(--bg); font-size: 10.5px; font-weight: 700; display: none; place-items: center; }
+    .fab.running .badge { display: grid; }
+    .hidden { display: none !important; }
+  </style>
+
+  <div class="root">
+    <button class="fab hidden" title="Batch Prompter">${I.bolt}<span class="badge"></span></button>
+
+    <div class="panel">
+      <div class="hdr">
+        <div class="logo">${I.bolt}</div>
+        <div class="title">Batch Prompter</div>
+        <span class="pill" data-pill><i></i><span>Готов</span></span>
+        <button class="icon-btn" data-min title="Свернуть">${I.min}</button>
+      </div>
+
+      <div class="body">
+        <!-- 1. Промпты -->
+        <div class="card prompts">
+          <div class="prompts-top">
+            <span class="sec-title">Промпты</span>
+            <span class="count" data-count></span>
+          </div>
+          <textarea data-k="text" spellcheck="false"
+            placeholder="Вставьте промпты — по одному на строку&#10;или перетащите сюда файл .txt / .csv"></textarea>
+          <div class="tools">
+            <div class="seg" data-seg title="Как разделены промпты">
+              <button data-v="line">По строкам</button>
+              <button data-v="blank">Пустая строка</button>
+              <button data-v="dash">---</button>
+            </div>
+            <button class="ghost" data-upload title="Загрузить .txt или .csv">${I.upload}Файл</button>
+            <button class="ghost sq" data-clear title="Очистить">${I.trash}</button>
+            <input type="file" accept=".txt,.csv,.tsv,text/plain,text/csv" data-file hidden>
+          </div>
+        </div>
+
+        <!-- 1б. Файлы -->
+        <div class="card files">
+          <div class="prompts-top">
+            <span class="sec-title">Прикреплять файлы <span style="text-transform:none;font-weight:400;letter-spacing:0">· необязательно</span></span>
+            <button class="clear-log" data-clearfiles>Сбросить</button>
+          </div>
+          <div class="frow">
+            <div class="fic">${I.doc}</div>
+            <div class="ftxt">
+              <div class="t">Общие файлы</div>
+              <div class="d" data-commoninfo>Файл, на который ссылаются промпты</div>
+            </div>
+            <button class="ghost" data-pickcommon>Выбрать</button>
+          </div>
+          <div class="seg small" data-cmode title="К какому промпту прикреплять общие файлы">
+            <button data-v="first">к первому промпту</button>
+            <button data-v="each">к каждому</button>
+          </div>
+          <div class="divider"></div>
+          <div class="frow">
+            <div class="fic">${I.img}</div>
+            <div class="ftxt">
+              <div class="t">Референсы к промптам</div>
+              <div class="d" data-refinfo>По колонке «реф_файл» из CSV или по номеру в имени</div>
+            </div>
+            <button class="ghost" data-pickword title="Достать картинки из таблицы Word-ТЗ">Word</button>
+            <button class="ghost" data-pickrefs title="Папка с картинками-референсами">Папка</button>
+          </div>
+          <input type="file" multiple hidden data-commonfile>
+          <input type="file" multiple webkitdirectory hidden data-refdir>
+          <input type="file" accept=".docx" hidden data-worddoc>
+        </div>
+
+        <!-- 1в. Доработка -->
+        <details class="card" data-editbox>
+          <summary>${I.wand}Доработка <span class="hint" data-edithint></span><span class="chev">${I.chev}</span></summary>
+          <div class="settings">
+            <div class="field">
+              <label>Универсальный промпт доработки</label>
+              <textarea class="inp small-ta" data-k="editPrompt" spellcheck="false"></textarea>
+            </div>
+            <div class="field">
+              <label>Суффикс к имени файла</label>
+              <input class="inp" data-k="editSuffix" placeholder="_black">
+            </div>
+            <label class="sw-row">
+              <div><div class="t">После каждой генерации</div><div class="d">Сразу отправлять доработку в тот же чат и скачать обе версии</div></div>
+              <span class="sw"><input type="checkbox" data-k="followUp"><span></span></span>
+            </label>
+            <div class="divider"></div>
+            <div class="frow">
+              <div class="fic">${I.img}</div>
+              <div class="ftxt">
+                <div class="t">Готовые картинки</div>
+                <div class="d" data-editinfo>Выберите папку — каждая картинка уйдёт с этим промптом</div>
+              </div>
+              <button class="ghost" data-pickedit>Папка</button>
+            </div>
+            <button class="btn secondary" data-runedit disabled>${I.wand}<span>Доработать картинки</span></button>
+            <input type="file" multiple webkitdirectory hidden data-editdir>
+          </div>
+        </details>
+
+        <!-- 2. Настройки -->
+        <details class="card" data-settings>
+          <summary>${I.gear}Настройки <span class="hint" data-summary></span><span class="chev">${I.chev}</span></summary>
+          <div class="settings">
+            <div class="field">
+              <label>Префикс перед каждым промптом</label>
+              <input class="inp" data-k="prefix" placeholder="например: Сгенерируй изображение:">
+            </div>
+            <div class="grid3">
+              <div class="field">
+                <label>Пауза, сек</label>
+                <div class="range">
+                  <input class="inp num" type="number" min="0" data-k="delayMin"><span>–</span>
+                  <input class="inp num" type="number" min="0" data-k="delayMax">
+                </div>
+              </div>
+              <div class="field"><label>Повторы</label><input class="inp num" type="number" min="0" max="5" data-k="retries" title="Сколько раз повторить промпт, если картинка не получилась"></div>
+              <div class="field"><label>Таймаут, мин</label><input class="inp num" type="number" min="1" data-k="timeoutMin" title="Максимальное время ожидания одного ответа"></div>
+            </div>
+            <div class="divider"></div>
+            <label class="sw-row">
+              <div><div class="t">Ждать картинку</div><div class="d">Считать ответ готовым, только когда картинка догрузилась</div></div>
+              <span class="sw"><input type="checkbox" data-k="waitImage"><span></span></span>
+            </label>
+            <label class="sw-row">
+              <div><div class="t">Скачивать картинки</div><div class="d">В «Загрузки» → папка ниже</div></div>
+              <span class="sw"><input type="checkbox" data-k="download"><span></span></span>
+            </label>
+            <div class="field" data-folder-field>
+              <input class="inp" data-k="folder" placeholder="ChatGPT_Images">
+            </div>
+          </div>
+        </details>
+
+        <!-- 3. Запуск -->
+        <div class="card runbox">
+          <div class="prog-top">
+            <div class="prog-num" data-prognum>0 <small>/ 0</small></div>
+            <div class="status" data-status>Готов к запуску</div>
+          </div>
+          <div class="bar"><i></i></div>
+          <div class="current hidden" data-current></div>
+          <div class="start-from">Начать с №<input class="inp num" type="number" min="1" data-k="startFrom"></div>
+          <div class="actions">
+            <button class="btn primary" data-start>${I.play}<span>Запустить</span></button>
+            <button class="btn secondary hidden" data-pause>${I.pause}<span>Пауза</span></button>
+            <button class="btn danger hidden" data-stop title="Остановить">${I.stop}</button>
+          </div>
+          <div class="flash" data-flash></div>
+        </div>
+
+        <!-- 4. Журнал -->
+        <details class="card" data-logbox>
+          <summary>Журнал <button class="clear-log" data-clearlog>Очистить</button><span class="chev" style="margin-left:0">${I.chev}</span></summary>
+          <div class="logtools">
+            <button class="ghost" data-test title="Вставить тестовый текст в поле ChatGPT без отправки">Проверить поле</button>
+            <button class="ghost" data-copy title="Скопировать подробный отчёт для отладки">Копировать отчёт</button>
+            <label class="mini-sw" title="Показывать технические подробности в журнале"><input type="checkbox" data-k="debug">подробно</label>
+          </div>
+          <div class="log" data-log><div class="empty">Здесь появится ход работы</div></div>
+        </details>
+      </div>
+    </div>
+  </div>`;
+
+  const q = (s) => shadow.querySelector(s);
+  Object.assign(ui, {
+    root: q('.root'), panel: q('.panel'), hdr: q('.hdr'), fab: q('.fab'), badge: q('.fab .badge'),
+    pill: q('[data-pill]'), status: q('[data-status]'), prognum: q('[data-prognum]'), bar: q('.bar i'),
+    current: q('[data-current]'), start: q('[data-start]'), pause: q('[data-pause]'), stop: q('[data-stop]'),
+    flash: q('[data-flash]'), log: q('[data-log]'), count: q('[data-count]'), seg: q('[data-seg]'),
+    file: q('[data-file]'), upload: q('[data-upload]'), clear: q('[data-clear]'), textarea: q('textarea'),
+    settings: q('[data-settings]'), summary: q('[data-summary]'), logbox: q('[data-logbox]'),
+    folderField: q('[data-folder-field]'),
+    fields: [...shadow.querySelectorAll('[data-k]')],
+    commonInfo: q('[data-commoninfo]'), refInfo: q('[data-refinfo]'), cmode: q('[data-cmode]'),
+    pickCommon: q('[data-pickcommon]'), pickRefs: q('[data-pickrefs]'), clearFiles: q('[data-clearfiles]'),
+    commonFile: q('[data-commonfile]'), refDir: q('[data-refdir]'),
+    pickWord: q('[data-pickword]'), wordDoc: q('[data-worddoc]'),
+    editBox: q('[data-editbox]'), editHint: q('[data-edithint]'), editInfo: q('[data-editinfo]'),
+    pickEdit: q('[data-pickedit]'), runEdit: q('[data-runedit]'), editDir: q('[data-editdir]'),
+  });
+
+  function refreshEdit() {
+    const n = files.edit.length;
+    ui.editInfo.textContent = n ? `Выбрано ${n} ${plural(n, 'картинка', 'картинки', 'картинок')}` : 'Выберите папку — каждая картинка уйдёт с этим промптом';
+    ui.editInfo.className = n ? 'd ok' : 'd';
+    shadow.querySelectorAll('[data-editbox] .fic')[0].classList.toggle('on', n > 0);
+    ui.runEdit.disabled = run.active || !n;
+    ui.runEdit.querySelector('span').textContent = n ? `Доработать ${n} ${plural(n, 'картинку', 'картинки', 'картинок')}` : 'Доработать картинки';
+    const bits = [];
+    if (S.followUp) bits.push('после каждой');
+    if (n) bits.push(`${n} в очереди`);
+    ui.editHint.textContent = bits.length ? '· ' + bits.join(' · ') : '';
+  }
+
+  function refreshFiles() {
+    const [cIc, rIc] = shadow.querySelectorAll('.files .fic');
+    // общие
+    if (files.common.length) {
+      ui.commonInfo.textContent = files.common.map((f) => f.name).join(', ');
+      ui.commonInfo.className = 'd ok'; cIc.classList.add('on');
+    } else {
+      ui.commonInfo.textContent = 'Файл, на который ссылаются промпты';
+      ui.commonInfo.className = 'd'; cIc.classList.remove('on');
+    }
+    [...ui.cmode.children].forEach((b) => b.classList.toggle('on', b.dataset.v === S.commonMode));
+    ui.cmode.classList.toggle('dim', !files.common.length);
+    // референсы
+    const n = parsePrompts(S.text, S.sep).length;
+    const wanted = (S.refs && S.refs.length === n) ? S.refs.filter(Boolean).length : 0;
+    if (files.refSource === 'word') {
+      const byHow = {};
+      let found = 0;
+      for (let i = 0; i < n; i++) { const w = wordRowFor(i); if (w) { found++; byHow[w.how] = (byHow[w.how] || 0) + 1; } }
+      const orderOnly = byHow['по порядку'] === found && found > 0;
+      ui.refInfo.textContent = `Word: ${files.word.length} картинок · для ${found} из ${n} промптов` + (orderOnly ? ' (по порядку)' : '');
+      ui.refInfo.className = found < n || orderOnly ? 'd warn' : 'd ok'; rIc.classList.add('on');
+      ui.refInfo.title = `${files.wordName}\n` + Object.entries(byHow).map(([h, c]) => `${h}: ${c}`).join('\n');
+    } else if (!files.refs.size) {
+      ui.refInfo.textContent = wanted ? `В CSV указано ${wanted} — выберите папку с ними` : 'По колонке «реф_файл» из CSV или по номеру в имени';
+      ui.refInfo.className = wanted ? 'd warn' : 'd'; rIc.classList.remove('on');
+      ui.refInfo.title = '';
+    } else {
+      const found = [], missing = [];
+      for (let i = 0; i < n; i++) {
+        if (refFor(i)) found.push(i + 1);
+        else if (wanted && S.refs[i]) missing.push(S.refs[i]);
+      }
+      ui.refInfo.textContent = `Найдено для ${found.length} из ${n} промптов` + (missing.length ? ` · нет: ${missing.length}` : '');
+      ui.refInfo.className = missing.length ? 'd warn' : 'd ok'; rIc.classList.add('on');
+      ui.refInfo.title = missing.length ? 'Не найдены: ' + missing.join(', ') : `Файлов в папке: ${files.refs.size}`;
+    }
+  }
+
+  // Не даём ChatGPT перехватывать клавиши и вставку внутри панели
+  ['keydown', 'keyup', 'keypress', 'paste', 'copy', 'cut'].forEach((ev) =>
+    host.addEventListener(ev, (e) => e.stopPropagation()));
+
+  // Тема — как у ChatGPT
+  const syncTheme = () => {
+    const html = document.documentElement;
+    const dark = html.classList.contains('dark') ||
+      (!html.classList.contains('light') && matchMedia('(prefers-color-scheme: dark)').matches);
+    ui.root.classList.toggle('dark', dark);
+  };
+  new MutationObserver(syncTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', syncTheme);
+
+  function readForm() {
+    for (const f of ui.fields) {
+      const k = f.dataset.k;
+      if (f.type === 'checkbox') S[k] = f.checked;
+      else if (f.type === 'number') S[k] = f.value === '' ? DEFAULTS[k] : Number(f.value);
+      else S[k] = f.value;
+    }
+    save();
+    refreshInfo();
+  }
+  function fillForm() {
+    for (const f of ui.fields) {
+      const k = f.dataset.k;
+      if (f.type === 'checkbox') f.checked = !!S[k]; else f.value = S[k];
+    }
+    ui.settings.open = !!S.settingsOpen;
+    ui.logbox.open = !!S.logOpen;
+    ui.editBox.open = !!S.editOpen;
+    refreshInfo();
+    setOpen(S.open);
+  }
+  function refreshInfo() {
+    refreshFiles();
+    refreshEdit();
+    const n = parsePrompts(S.text, S.sep).length;
+    ui.count.innerHTML = n ? `<b>${n}</b> ${plural(n, 'промпт', 'промпта', 'промптов')}` : 'пусто';
+    [...ui.seg.children].forEach((b) => b.classList.toggle('on', b.dataset.v === S.sep));
+    ui.folderField.classList.toggle('hidden', !S.download);
+    const bits = [`${S.delayMin}–${S.delayMax} с`];
+    if (S.download) bits.push('скачивание');
+    if (S.prefix.trim()) bits.push('префикс');
+    ui.summary.textContent = '· ' + bits.join(' · ');
+    if (!run.active) setProgress(Math.max(0, Math.min(n, (S.startFrom || 1) - 1)), n);
+  }
+  const plural = (n, a, b, c) => {
+    const m10 = n % 10, m100 = n % 100;
+    return m10 === 1 && m100 !== 11 ? a : (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? b : c);
+  };
+  function syncStartField() {
+    const f = ui.fields.find((x) => x.dataset.k === 'startFrom');
+    if (f) f.value = S.startFrom;
+  }
+  function setProgress(done, total) {
+    ui.bar.style.width = `${total ? (done / total) * 100 : 0}%`;
+    ui.prognum.innerHTML = `${done} <small>/ ${total}</small>`;
+    ui.badge.textContent = `${done}/${total}`;
+  }
+  function setCurrent(num, text) {
+    if (!num) { ui.current.classList.add('hidden'); return; }
+    ui.current.classList.remove('hidden');
+    ui.current.innerHTML = '';
+    const b = document.createElement('b'); b.textContent = `#${num} `;
+    ui.current.append(b, document.createTextNode(text));
+  }
+  const PILL = { idle: 'Готов', gen: 'Работает', wait: 'Работает', paused: 'Пауза', error: 'Ошибка', done: 'Готово' };
+  function setStatus(kind, text) {
+    ui.pill.className = `pill ${kind}`;
+    ui.pill.querySelector('span').textContent = PILL[kind] || '';
+    ui.status.textContent = text;
+  }
+  function flash(msg) {
+    ui.flash.textContent = msg;
+    clearTimeout(flash.t);
+    flash.t = setTimeout(() => { ui.flash.textContent = ''; }, 4000);
+  }
+  function updateButtons() {
+    ui.start.classList.toggle('hidden', run.active);
+    ui.pause.classList.toggle('hidden', !run.active);
+    ui.stop.classList.toggle('hidden', !run.active);
+    ui.pause.innerHTML = run.paused ? `${I.play}<span>Продолжить</span>` : `${I.pause}<span>Пауза</span>`;
+    ui.fields.forEach((f) => { f.disabled = run.active; });
+    [...ui.seg.children, ui.upload, ui.clear, ui.pickCommon, ui.pickRefs, ui.pickWord, ui.clearFiles, ...ui.cmode.children, ui.pickEdit]
+      .forEach((b) => { b.disabled = run.active; });
+    refreshEdit();
+    ui.fab.classList.toggle('running', run.active);
+    if (!run.active && !['done', 'error'].includes(ui.pill.classList[1])) setStatus('idle', 'Готов к запуску');
+  }
+  // Полный отчёт (включая технические детали) — для «Копировать отчёт»
+  const report = [];
+  const now = () => new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  function pushReport(line) {
+    report.push(line);
+    if (report.length > 1500) report.splice(0, report.length - 1500);
+  }
+  function log(msg, type = 'info') {
+    pushReport(`[${now()}] ${type.toUpperCase()} ${msg}`);
+    addLogLine(msg, type);
+  }
+  // Технические подробности: всегда в отчёт, в журнал — если включён «Подробный журнал»
+  function dbg(msg, data) {
+    pushReport(`[${now()}] DBG ${msg}${data ? '\n' + JSON.stringify(data, null, 2) : ''}`);
+    if (S.debug) addLogLine(msg + (data ? ` · поле: ${data.input}; отправить: ${data.send}` : ''), 'dbg');
+  }
+  function addLogLine(msg, type) {
+    const empty = ui.log.querySelector('.empty');
+    if (empty) empty.remove();
+    const e = document.createElement('div');
+    e.className = `e ${type}`;
+    const tm = document.createElement('span'); tm.className = 'tm';
+    tm.textContent = now();
+    const tx = document.createElement('span'); tx.className = 'tx'; tx.textContent = msg;
+    e.append(tm, tx);
+    ui.log.append(e);
+    while (ui.log.children.length > 300) ui.log.firstChild.remove();
+    ui.log.scrollTop = ui.log.scrollHeight;
+  }
+  async function copyReport() {
+    const head = [
+      'Batch Prompter — отчёт',
+      `Время: ${new Date().toLocaleString()}`,
+      `Настройки: ${JSON.stringify({ sep: S.sep, prefix: S.prefix, delay: [S.delayMin, S.delayMax], waitImage: S.waitImage, download: S.download, retries: S.retries, timeoutMin: S.timeoutMin, startFrom: S.startFrom, prompts: parsePrompts(S.text, S.sep).length })}`,
+      'Состояние сейчас:',
+      JSON.stringify(diag(), null, 2),
+      '─── Журнал ───',
+    ];
+    const text = head.concat(report).join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = text; shadow.append(ta); ta.select(); document.execCommand('copy'); ta.remove();
+    }
+    flash('Отчёт скопирован — вставьте его в чат (Ctrl+V)');
+    ui.flash.style.color = 'var(--accent)';
+    setTimeout(() => { ui.flash.style.color = ''; }, 4000);
+  }
+  function setOpen(open) {
+    S.open = open;
+    ui.panel.classList.toggle('hidden', !open);
+    ui.fab.classList.toggle('hidden', open);
+    save();
+  }
+
+  // Перетаскивание панели за шапку
+  function applyPos() {
+    if (!S.pos) return;
+    const r = ui.panel.getBoundingClientRect();
+    const x = Math.min(Math.max(8, S.pos.x), innerWidth - r.width - 8);
+    const y = Math.min(Math.max(8, S.pos.y), innerHeight - 60);
+    Object.assign(ui.panel.style, { left: `${x}px`, top: `${y}px`, right: 'auto', bottom: 'auto', maxHeight: `calc(100vh - ${y + 8}px)` });
+  }
+  ui.hdr.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('button')) return;
+    const r = ui.panel.getBoundingClientRect();
+    const dx = e.clientX - r.left, dy = e.clientY - r.top;
+    const move = (ev) => { S.pos = { x: ev.clientX - dx, y: ev.clientY - dy }; applyPos(); };
+    const up = () => { removeEventListener('pointermove', move); removeEventListener('pointerup', up); save(); };
+    addEventListener('pointermove', move);
+    addEventListener('pointerup', up);
+  });
+  ui.hdr.addEventListener('dblclick', () => {
+    S.pos = null; save();
+    Object.assign(ui.panel.style, { left: '', top: '', right: '', bottom: '', maxHeight: '' });
+  });
+  addEventListener('resize', applyPos);
+
+  // Загрузка файла
+  async function loadFile(file) {
+    const text = await file.text();
+    let prompts, names = [], refs = [], rows = [];
+    if (/\.(csv|tsv)$/i.test(file.name)) ({ prompts, names, refs, rows } = parseCSV(text));
+    else prompts = parsePrompts(text, S.sep);
+    // Если в промптах есть переносы строк — разделяем через ---
+    const multi = prompts.some((p) => p.includes('\n'));
+    S.sep = multi ? 'dash' : 'line';
+    S.text = prompts.join(multi ? '\n---\n' : '\n');
+    S.names = names.some(Boolean) ? names : [];
+    S.refs = refs.some(Boolean) ? refs : [];
+    S.wordRows = rows.some(Boolean) ? rows : [];
+    S.startFrom = 1;
+    fillForm(); save();
+    log(`Загружен ${file.name}: ${prompts.length} ${plural(prompts.length, 'промпт', 'промпта', 'промптов')}` +
+      (S.names.length ? ', имена файлов из CSV' : ''), 'info');
+  }
+
+  // События
+  ui.fields.forEach((f) => f.addEventListener(f.type === 'checkbox' ? 'change' : 'input', readForm));
+  // Файлы для прикрепления
+  ui.pickCommon.addEventListener('click', () => ui.commonFile.click());
+  ui.commonFile.addEventListener('change', () => {
+    files.common = [...ui.commonFile.files];
+    ui.commonFile.value = '';
+    if (files.common.length) log(`Общие файлы: ${files.common.map((f) => f.name).join(', ')}`, 'info');
+    refreshFiles();
+  });
+  // Референсы из Word-ТЗ: картинки из строк таблицы
+  ui.pickWord.addEventListener('click', () => ui.wordDoc.click());
+  ui.wordDoc.addEventListener('change', async () => {
+    const f = ui.wordDoc.files[0];
+    ui.wordDoc.value = '';
+    if (!f) return;
+    try {
+      const rows = await parseWordTZ(f);
+      if (!rows.length) { log(`В «${f.name}» не нашлось таблицы с картинками`, 'err'); return; }
+      files.word = rows; files.wordName = f.name; files.refSource = 'word';
+      log(`Word «${f.name}»: ${rows.length} картинок — ${rows.map((r) => r.label).join(', ')}`, 'info');
+      // Показываем, какой промпт получит какую картинку
+      const n = parsePrompts(S.text, S.sep).length;
+      for (let i = 0; i < n; i++) {
+        const w = wordRowFor(i);
+        log(`  #${i + 1} ← ${w ? `${w.row.label}${w.row.title ? ' · ' + w.row.title.slice(0, 40) : ''} (${w.how})` : 'нет'}`, w ? (w.how === 'по порядку' ? 'warn' : 'info') : 'warn');
+      }
+    } catch (e) {
+      log(`Не удалось прочитать Word: ${e.message}`, 'err');
+    }
+    refreshFiles();
+  });
+  ui.pickRefs.addEventListener('click', () => ui.refDir.click());
+  ui.refDir.addEventListener('change', () => {
+    files.refs = new Map();
+    for (const f of ui.refDir.files) {
+      if (!isImageFile(f) && !/\.(pdf|docx?|txt)$/i.test(f.name)) continue;
+      const b = baseName(f.name);
+      files.refs.set(b, f);
+      if (!files.refs.has(stripExt(b))) files.refs.set(stripExt(b), f);
+    }
+    ui.refDir.value = '';
+    const uniq = new Set(files.refs.values()).size;
+    files.refSource = 'folder';
+    log(`Папка с референсами: ${uniq} файлов`, 'info');
+    refreshFiles();
+  });
+  // Доработка готовых картинок
+  ui.pickEdit.addEventListener('click', () => ui.editDir.click());
+  ui.editDir.addEventListener('change', () => {
+    files.edit = [...ui.editDir.files].filter(isImageFile)
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    ui.editDir.value = '';
+    log(`Для доработки: ${files.edit.length} картинок`, 'info');
+    refreshEdit();
+  });
+  ui.runEdit.addEventListener('click', () => { if (!run.active) start('edit'); });
+  ui.editBox.addEventListener('toggle', () => { S.editOpen = ui.editBox.open; save(); });
+
+  ui.cmode.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-v]');
+    if (!b || run.active) return;
+    S.commonMode = b.dataset.v; save(); refreshFiles();
+  });
+  ui.clearFiles.addEventListener('click', () => {
+    if (run.active) return;
+    files.common = []; files.refs = new Map(); files.word = []; files.wordName = ''; files.refSource = ''; refreshFiles();
+  });
+
+  ui.seg.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-v]');
+    if (!b || run.active) return;
+    S.sep = b.dataset.v; save(); refreshInfo();
+  });
+  ui.upload.addEventListener('click', () => ui.file.click());
+  ui.file.addEventListener('change', async () => {
+    if (ui.file.files[0]) await loadFile(ui.file.files[0]);
+    ui.file.value = '';
+  });
+  ui.clear.addEventListener('click', () => {
+    if (!S.text.trim() || confirm('Очистить список промптов?')) {
+      S.text = ''; S.names = []; S.refs = []; S.startFrom = 1; fillForm(); save();
+    }
+  });
+  ui.textarea.addEventListener('dragover', (e) => {
+    if (run.active || !e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault(); ui.textarea.classList.add('drag');
+  });
+  ui.textarea.addEventListener('dragleave', () => ui.textarea.classList.remove('drag'));
+  ui.textarea.addEventListener('drop', async (e) => {
+    ui.textarea.classList.remove('drag');
+    const f = e.dataTransfer.files[0];
+    if (!f || run.active) return;
+    e.preventDefault();
+    await loadFile(f);
+  });
+  ui.settings.addEventListener('toggle', () => { S.settingsOpen = ui.settings.open; save(); });
+  ui.logbox.addEventListener('toggle', () => { S.logOpen = ui.logbox.open; save(); });
+  q('[data-clearlog]').addEventListener('click', (e) => {
+    e.preventDefault(); e.stopPropagation();
+    ui.log.innerHTML = '<div class="empty">Здесь появится ход работы</div>';
+  });
+  q('[data-test]').addEventListener('click', async (e) => {
+    if (run.active) { flash('Сначала остановите очередь'); return; }
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try { await testInput(); } finally { btn.disabled = false; }
+  });
+  q('[data-copy]').addEventListener('click', copyReport);
+  q('[data-min]').addEventListener('click', () => setOpen(false));
+  ui.fab.addEventListener('click', () => setOpen(true));
+  ui.start.addEventListener('click', () => { if (!run.active) start(); });
+  ui.pause.addEventListener('click', () => {
+    run.paused = !run.paused;
+    if (run.paused) { log('Пауза после текущего промпта', 'warn'); setStatus('paused', 'Пауза после текущего промпта'); }
+    else log('Продолжаем', 'info');
+    updateButtons();
+  });
+  ui.stop.addEventListener('click', () => { run.stop = true; run.paused = false; setStatus('paused', 'Останавливаем…'); });
+
+  let ready = false, openRequested = false;
+  const onMsg = (msg) => {
+    if (!msg) return;
+    if (msg.type === 'toggle') { if (ready) setOpen(!S.open); else openRequested = true; }
+    if (msg.type === 'open') { if (ready) setOpen(true); else openRequested = true; }
+  };
+  chrome.runtime.onMessage.addListener(onMsg);
+
+  // Нас заменяет новая версия расширения — останавливаемся и убираем панель
+  document.addEventListener('cgpt-batch-kill', () => {
+    run.stop = true;
+    host.remove();
+    try { chrome.runtime.onMessage.removeListener(onMsg); } catch { /* контекст уже недействителен */ }
+  }, { once: true });
+
+  (async () => {
+    await load();
+    document.documentElement.appendChild(host);
+    syncTheme();
+    fillForm();
+    ready = true;
+    if (openRequested) setOpen(true);
+    applyPos();
+    setStatus('idle', 'Готов к запуску');
+    if (S.startFrom > 1 && parsePrompts(S.text, S.sep).length) {
+      ui.status.textContent = `Можно продолжить с №${S.startFrom}`;
+    }
+  })();
+})();
