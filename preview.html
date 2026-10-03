@@ -94,7 +94,8 @@ function pick2(n) {
   const t = ed.innerText.replace(/@\S*\s*$/, '');
   ed.innerHTML = `<p><span contenteditable="false" data-mention="1" style="background:#1d4d3f;border-radius:6px;padding:0 6px">@${n}</span>&nbsp;${t ? t : ''}</p>`;
   const c = document.createElement('canvas'); c.width = c.height = 40; c.getContext('2d').fillStyle = '#c33'; c.getContext('2d').fillRect(0,0,40,40);
-  const chip = document.createElement('div'); chip.className = 'chip'; chip.innerHTML = `<img src="${c.toDataURL()}"> ${n}`; att.append(chip);
+  const chip = document.createElement('div'); chip.className = 'chip'; chip.innerHTML = `<img src="${c.toDataURL()}"> ${n} <button type="button" aria-label="Удалить файл" style="width:20px;height:20px;border-radius:50%">×</button>`; att.append(chip);
+  chip.querySelector('button').addEventListener('click', () => { chip.remove(); pending = pending.filter(p => p.name !== n + '.png'); render(); });
   pending.push({ name: n + '.png', type: 'image/png', lib: true }); window.__libPicked = (window.__libPicked || 0) + 1;
   closeMenu(); render();
   const r = document.createRange(); r.selectNodeContents(ed); r.collapse(false); const s = getSelection(); s.removeAllRanges(); s.addRange(r);
@@ -117,12 +118,19 @@ function send() {
   genState = true; render('gen');
   const a = document.createElement('article'); a.dataset.testid = 'conversation-turn-' + (2*n); a.dataset.turn = 'assistant';
   a.innerHTML = '<div data-message-author-role="assistant">Creating image</div>'; chat.append(a);
+  if (location.search.includes('limit') && n === 1) { // имитация лимита на первом промпте
+    setTimeout(() => {
+      a.innerHTML = '<div data-message-author-role="assistant">You\'ve reached the current usage cap for image generation. Please try again in 3 seconds.</div>';
+      genState = false; render();
+    }, 1500);
+    return;
+  }
   setTimeout(() => {
     const c = document.createElement('canvas'); c.width = c.height = 512; const g = c.getContext('2d');
     g.fillStyle = `hsl(${n*70},60%,45%)`; g.fillRect(0,0,512,512); g.fillStyle='#fff'; g.font='bold 120px sans-serif'; g.fillText('#'+n, 150, 300);
     a.innerHTML = `<div data-message-author-role="assistant">Image created</div><img src="${c.toDataURL()}">`;
     genState = false; render();
-  }, 3000);
+  }, location.search.includes("slowgen") ? 12000 : 3000);
 }
 render();
 
@@ -133,7 +141,9 @@ window.chrome = { storage: { local: { get: async k => ({ [k]: store[k] }), set: 
       const t = setInterval(() => { window.__ticks++; l.forEach(f => f('tick')); }, 500);
       return { onMessage: { addListener: f => l.push(f) }, onDisconnect: { addListener: f => d.push(f) },
         postMessage() {}, disconnect() { clearInterval(t); } }; },
-    onMessage: { addListener() {} }, sendMessage: async m => { __downloads.push(m.filename); return { ok: true }; } } };
+    onMessage: { addListener() {} }, sendMessage: async m => {
+      if (m.type === 'notify') { (window.__notes = window.__notes || []).push(m.title + ' | ' + m.message); return { ok: true }; }
+      __downloads.push(m.filename); return { ok: true }; } } };
 store.cgptBatch = { text: 'кот в скафандре на Луне\nзакат над горами, акварель\nлоготип кофейни', delayMin: 1, delayMax: 1, logOpen: true,
   names: ['gpt_mock_01', 'gpt_mock_02', 'gpt_mock_03'], refs: ['01_slide1_bus.png', '02_slide2_bus3.png', ''] };
 </script><script src="content.js"></script></body></html>

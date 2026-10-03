@@ -3,14 +3,15 @@
   "name": "ChatGPT Batch Prompter",
   "version": "1.0.0",
   "description": "Отправляет промпты в ChatGPT по очереди, ждёт окончания генерации и скачивает картинки.",
-  "permissions": ["storage", "downloads", "scripting"],
+  "permissions": ["storage", "downloads", "scripting", "notifications"],
+  "icons": { "128": "icon.png" },
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://chat.openai.com/*",
     "https://*.oaiusercontent.com/*"
   ],
   "background": { "service_worker": "background.js" },
-  "action": { "default_title": "ChatGPT Batch Prompter — показать/скрыть панель" },
+  "action": { "default_title": "ChatGPT Batch Prompter — показать/скрыть панель", "default_icon": { "128": "icon.png" } },
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],

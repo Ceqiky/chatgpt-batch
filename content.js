@@ -81,7 +81,7 @@
     text: '', sep: 'line', prefix: '',
     delayMin: 5, delayMax: 10,
     waitImage: true, download: true, folder: 'ChatGPT_Images',
-    retries: 1, timeoutMin: 10, startFrom: 1, names: [], refs: [], wordRows: [], commonMode: 'first', debug: true,
+    retries: 1, timeoutMin: 10, startFrom: 1, names: [], refs: [], wordRows: [], commonMode: 'first', debug: false,
     editPrompt: `Edit this image using targeted inpainting — do NOT re-render or redraw the scene. Treat the image as a fixed plate: only the regions listed under REMOVE may change; every other pixel must stay as close to the original as possible.
 
 REMOVE completely (fill every freed area with the plain black background — never with new objects or texture):
@@ -102,7 +102,7 @@ DO NOT: add any new element, text or decoration; move, resize, restyle, recolour
 
 RESULT: the same scene, isolated on a clean pure black background — only the objects, their lines and arrows, shadows and native glow — ready for compositing with the Screen blend mode. Clean edges, no dark halo or grey fringe around objects.`,
     editSuffix: '_black', followUp: false, editOpen: false,
-    libMode: false, libName: '', prepAhead: true,
+    libMode: false, libName: '', prepAhead: true, notify: true,
     open: true, settingsOpen: false, logOpen: true, pos: null,
   };
   let S = { ...DEFAULTS };
@@ -721,6 +721,11 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
 
   async function attachFiles(list) {
     for (const file of list) {
+      // При повторе документ уже может висеть в поле — второй раз не прикрепляем
+      if (!isImageFile(file) && composerSnapshot().text.includes(stripExt(file.name.toLowerCase()).slice(0, 18))) {
+        dbg(`Файл «${file.name}» уже прикреплён — пропускаю`);
+        continue;
+      }
       let ok = false;
       for (const [name, fn] of ATTACH_METHODS) {
         checkStop();
@@ -805,6 +810,41 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     while (isGenerating() && Date.now() - t0 < S.timeoutMin * 60000) { checkStop(); await sleep(400); }
   }
 
+  // ─── Лимиты ChatGPT и уведомления ───
+  const LIMIT_RE = /(too many (requests|images)|rate limit|reached (the |your )?(current )?(usage |daily |hourly )?(cap|limit)|usage cap|image generation limit|слишком много запросов|достигли (текущего )?лимита|достигнут лимит|лимит[^.]{0,40}(исчерпан|достигнут)|повторите попытку|попробуйте (снова|позже|ещё раз|еще раз) через|try again (later|in))/i;
+  function limitText() {
+    const parts = [lastTurnText()];
+    for (const e of $$('[role="alert"], [role="dialog"], [role="status"], [data-testid*="toast" i], [class*="toast" i]')) {
+      if (isVisible(e) && !host.contains(e)) parts.push(e.innerText || '');
+    }
+    return parts.join('\n');
+  }
+  // Сколько ждать: «через 3 минуты», «in 2 hours»; если не указано — 15 минут
+  function parseWaitMs(t) {
+    const m = t.match(/(\d+(?:[.,]\d+)?)\s*(секунд\w*|сек\b|seconds?|secs?|минут\w*|мин\b|minutes?|mins?|час\w*|hours?|hrs?)/i);
+    if (!m) return 15 * 60000;
+    const n = parseFloat(m[1].replace(',', '.')), u = m[2].toLowerCase();
+    const mult = /^(сек|sec)/.test(u) ? 1000 : /^(мин|min)/.test(u) ? 60000 : 3600000;
+    return Math.round(n * mult) + 5000;
+  }
+  function detectLimit() {
+    const t = limitText(), m = t.match(LIMIT_RE);
+    if (!m) return null;
+    return { text: norm(t.slice(Math.max(0, m.index - 30), m.index + 150)), waitMs: parseWaitMs(t.slice(m.index)) };
+  }
+  async function waitLimit(lim, label) {
+    const ms = Math.min(Math.max(lim.waitMs, 10000), 3 * 3600000);
+    log(`${label}: лимит ChatGPT — жду ${fmtTime(Math.round(ms / 1000))} и продолжу сам`, 'warn');
+    dbg('Текст про лимит', { text: lim.text });
+    notify('Лимит ChatGPT', `Очередь ждёт ${fmtTime(Math.round(ms / 1000))} и продолжит сама`);
+    await sleepChecked(ms, (s) => setStatus('wait', `Лимит ChatGPT — осталось ${fmtTime(s)}`));
+  }
+  // Уведомление Chrome (показывает фоновая часть расширения)
+  function notify(title, message) {
+    if (!S.notify || !extAlive()) return;
+    try { chrome.runtime.sendMessage({ type: 'notify', title, message }).catch(() => {}); } catch { /* контекст недействителен */ }
+  }
+
   async function waitDone(before, turnsBefore) {
     const t0 = Date.now();
     const timeout = Math.max(1, +S.timeoutMin) * 60000;
@@ -816,7 +856,12 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       if (isGenerating() || countTurns() > turnsBefore) { started = true; break; }
       await sleep(500);
     }
-    if (!started) { dbg('Генерация не началась за 30 с', diag()); return { ok: false, reason: 'генерация не началась' }; }
+    if (!started) {
+      const lim = detectLimit();
+      if (lim) return { ok: false, limit: lim, reason: 'лимит ChatGPT' };
+      dbg('Генерация не началась за 30 с', diag());
+      return { ok: false, reason: 'генерация не началась' };
+    }
     dbg(`Генерация началась (stop-кнопка: ${isGenerating() ? 'есть' : 'нет'}, сообщений ${countTurns()})`);
 
     // 2) Дождаться окончания
@@ -834,6 +879,11 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       if (isGenerating()) { idleSince = 0; await sleep(500); continue; }
       if (!idleSince) idleSince = Date.now();
       const quietMs = Date.now() - lastMut;
+      // Генерация закончилась, а картинки нет — возможно, ChatGPT ответил, что исчерпан лимит
+      if (S.waitImage && quietMs > 800 && !newImages(before).length) {
+        const lim = detectLimit();
+        if (lim) return { ok: false, limit: lim, reason: 'лимит ChatGPT' };
+      }
 
       if (!S.waitImage) {
         if (quietMs > 2500) break;
@@ -918,7 +968,24 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     }
   }
 
+  // После остановки / ошибки / конца: убрать из поля ввода всё, что осталось от нас —
+  // заготовку следующего промпта, «@файл» и превью вложений (иначе их легко отправить случайно)
+  const ATTACH_REMOVE_RE = /(remove|удалить|убрать)[^]*(file|файл|image|изображ|attachment|вложен)|(file|файл|image|изображ|attachment|вложен)[^]*(remove|удалить|убрать)/i;
+  function cleanupComposer() {
+    prepared = null;
+    try {
+      const el = findInput();
+      if (!el) return;
+      if (norm(inputText(el))) clearInput(el);
+      const root = composerRoot();
+      if (root) for (const b of $$('button', root)) {
+        if (isVisible(b) && ATTACH_REMOVE_RE.test(b.getAttribute('aria-label') || '')) b.click();
+      }
+    } catch { /* страница могла измениться — не критично */ }
+  }
+
   async function runJob(job, next) {
+    let limitWaits = 0;
     for (let attempt = 0; attempt <= S.retries; attempt++) {
       if (attempt > 0) {
         log(`${job.label}: повтор ${attempt} из ${S.retries}`, 'warn');
@@ -975,6 +1042,15 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       if (S.prepAhead && next) await prepareNext(next);
 
       const r = await waitDone(before, turns);
+      if (!r.ok && r.limit && limitWaits < 12) {
+        // Лимит — не ошибка промпта: ждём и повторяем, попытка не тратится
+        limitWaits++;
+        const inp2 = findInput(); if (inp2) clearInput(inp2); // убрать заготовку следующего, она пересоберётся
+        prepared = null;
+        await waitLimit(r.limit, job.label);
+        attempt--;
+        continue;
+      }
       if (!r.ok) { log(`${job.label}: ${r.reason}`, 'err'); continue; }
 
       if (!S.waitImage) { log(`${job.label} готово`, 'ok'); return { ok: true, imgs: 0 }; }
@@ -1053,6 +1129,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
         const res = await runJob(job, followUp ? null : jobs[i + 1]);
         if (!res.ok) {
           log(`${job.label} не получился. «Продолжить» повторит его`, 'warn');
+          notify('Очередь на паузе', `${job.label} не получился — нужна проверка`);
           run.paused = true; updateButtons();
           setStatus('error', 'Ошибка — очередь на паузе');
           await waitPause();
@@ -1086,14 +1163,20 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       const took = fmtTime(Math.round((Date.now() - t0) / 1000));
       log(`Готово: ${okCount} ${isEdit ? 'картинок доработано' : 'промптов'}${S.waitImage ? `, скачано ${imgCount}` : ''} за ${took}`, 'ok');
       setStatus('done', isEdit ? 'Доработка завершена' : 'Все промпты выполнены');
+      notify('Готово', `${okCount} ${isEdit ? 'картинок доработано' : 'промптов выполнено'} за ${took}`);
       setCurrent(null);
       if (!isEdit) { S.startFrom = 1; save(); syncStartField(); }
     } catch (e) {
       if (e.message === 'STOP') {
         log(isEdit ? 'Остановлено' : `Остановлено. Продолжить можно с №${S.startFrom}`, 'warn');
         setStatus('idle', 'Остановлено');
-      } else { log(`Ошибка: ${e.message}`, 'err'); setStatus('error', 'Ошибка'); }
+      } else {
+        log(`Ошибка: ${e.message}`, 'err'); setStatus('error', 'Ошибка');
+        notify('Очередь остановлена', e.message);
+      }
     }
+    // Убираем за собой: заготовку следующего промпта, «@файл» и превью вложений в поле ввода
+    cleanupComposer();
     run.active = false; run.paused = false;
     stopTicker();
     updateButtons();
@@ -1423,6 +1506,10 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
             <label class="sw-row">
               <div><div class="t">Готовить следующий заранее</div><div class="d">Пока идёт генерация, уже вставлять @файл и текст следующего промпта</div></div>
               <span class="sw"><input type="checkbox" data-k="prepAhead"><span></span></span>
+            </label>
+            <label class="sw-row">
+              <div><div class="t">Уведомления</div><div class="d">Сообщать, когда очередь закончилась, встала на паузу или ждёт лимит</div></div>
+              <span class="sw"><input type="checkbox" data-k="notify"><span></span></span>
             </label>
             <label class="sw-row">
               <div><div class="t">Скачивать картинки</div><div class="d">В «Загрузки» → папка ниже</div></div>

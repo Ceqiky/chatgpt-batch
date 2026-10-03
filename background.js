@@ -54,6 +54,29 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onDisconnect.addListener(() => clearInterval(timer));
 });
 
+// Уведомления Chrome (очередь закончилась / встала / ждёт лимит). Клик — вернуться на вкладку ChatGPT.
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (!msg || msg.type !== 'notify') return;
+  const id = `batch-${Date.now()}`;
+  chrome.notifications.create(id, {
+    type: 'basic', iconUrl: 'icon.png',
+    title: String(msg.title || 'Batch Prompter').slice(0, 80),
+    message: String(msg.message || '').slice(0, 200) || ' ',
+  });
+  if (sender.tab) notifTabs.set(id, { tabId: sender.tab.id, windowId: sender.tab.windowId });
+});
+const notifTabs = new Map();
+chrome.notifications.onClicked.addListener(async (id) => {
+  const t = notifTabs.get(id);
+  chrome.notifications.clear(id);
+  notifTabs.delete(id);
+  if (!t) return;
+  try {
+    await chrome.tabs.update(t.tabId, { active: true });
+    await chrome.windows.update(t.windowId, { focused: true });
+  } catch { /* вкладку могли закрыть */ }
+});
+
 // Скачивание картинок по запросу из content.js
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === 'download') {
