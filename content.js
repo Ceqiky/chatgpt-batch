@@ -6,6 +6,9 @@
   document.dispatchEvent(new CustomEvent('cgpt-batch-kill'));
   document.querySelectorAll('#cgpt-batch-host').forEach((el) => el.remove());
 
+  // Версия из manifest.json — видна в шапке панели и в отчёте: сразу ясно, какой код сейчас работает
+  const VERSION = (() => { try { return chrome.runtime.getManifest().version; } catch { return '?'; } })();
+
   // ─── Селекторы ChatGPT. Если OpenAI поменяет вёрстку — править здесь. ───
   const SEL = {
     // Порядок важен: сначала contenteditable-редактор, textarea — только запасной вариант
@@ -301,16 +304,23 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     if (!el) return;
     el.focus();
     if (el.tagName === 'TEXTAREA') { setTextareaValue(el, ''); return; }
-    try {
-      const sel = getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(el);
-      sel.removeAllRanges(); sel.addRange(range);
-    } catch {
-      document.execCommand('selectAll', false); // запасной способ выделить всё
+    // Chrome не выделяет диапазон вне основного документа (отвалившийся элемент, shadow DOM) и
+    // пишет в консоль предупреждение «addRange(): range isn't in document» — поэтому проверяем заранее
+    if (inMainDocument(el)) {
+      try {
+        const sel = getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        sel.removeAllRanges(); sel.addRange(range);
+      } catch {
+        document.execCommand('selectAll', false);
+      }
+    } else {
+      document.execCommand('selectAll', false); // запасной способ выделить всё в сфокусированном поле
     }
     document.execCommand('delete', false);
   }
+  const inMainDocument = (el) => !!el && el.isConnected && el.getRootNode() === document;
   function setTextareaValue(el, v) {
     Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(el, v);
     el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -345,11 +355,12 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     if (!el) return;
     el.focus();
     if (el.tagName === 'TEXTAREA') { el.selectionStart = el.selectionEnd = el.value.length; return; }
+    if (!inMainDocument(el)) return; // каретка встанет сама при фокусе
     try {
       const sel = getSelection(), range = document.createRange();
       range.selectNodeContents(el); range.collapse(false);
       sel.removeAllRanges(); sel.addRange(range);
-    } catch { /* поле перерисовали — каретка встанет сама при фокусе */ }
+    } catch { /* поле перерисовали */ }
   }
   // keep=true — дописать текст в конец, не стирая то, что уже есть в поле (ссылку @файл)
   function keepMatches(el, text) {
@@ -1282,6 +1293,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     .hdr:active { cursor: grabbing; }
     .logo { width: 28px; height: 28px; border-radius: 9px; background: var(--accent); color: #fff; display: grid; place-items: center; }
     .title { font-weight: 650; font-size: 14px; flex: 1; letter-spacing: -.01em; }
+    .ver { font-weight: 400; font-size: 11px; color: var(--muted); margin-left: 4px; }
     .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 99px;
       font-size: 11.5px; font-weight: 600; background: var(--bg3); color: var(--muted); white-space: nowrap; }
     .pill i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
@@ -1422,7 +1434,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     <div class="panel">
       <div class="hdr">
         <div class="logo">${I.bolt}</div>
-        <div class="title">Batch Prompter</div>
+        <div class="title">Batch Prompter <span class="ver">v${VERSION}</span></div>
         <span class="pill" data-pill><i></i><span>Готов</span></span>
         <button class="icon-btn" data-min title="Свернуть">${I.min}</button>
       </div>
@@ -1790,7 +1802,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   }
   async function copyReport() {
     const head = [
-      'Batch Prompter — отчёт',
+      `Batch Prompter v${VERSION} — отчёт`,
       `Время: ${new Date().toLocaleString()}`,
       `Настройки: ${JSON.stringify({ sep: S.sep, prefix: S.prefix, delay: [S.delayMin, S.delayMax], waitImage: S.waitImage, download: S.download, retries: S.retries, timeoutMin: S.timeoutMin, startFrom: S.startFrom, prompts: parsePrompts(S.text, S.sep).length })}`,
       'Состояние сейчас:',
