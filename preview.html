@@ -1,0 +1,139 @@
+<!doctype html><html class="dark"><head><meta charset="utf-8">
+<style>
+body{margin:0;background:#212121;color:#ddd;font-family:sans-serif}
+main{padding:20px 420px 180px 20px}
+article{margin:10px 0;padding:10px;border-radius:10px;background:#2a2a2a}
+form{position:fixed;left:20px;bottom:20px;width:600px;background:#303030;border-radius:24px;padding:12px}
+.row{display:flex;gap:8px}
+#att{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px}
+#att .chip{background:#444;border-radius:8px;padding:4px 8px;font-size:12px;display:flex;gap:6px;align-items:center}
+#att img{width:40px;height:40px;object-fit:cover;border-radius:6px}
+#prompt-textarea{flex:1;min-height:24px;outline:none}
+#prompt-textarea p{margin:0}
+.fallback{display:none}
+button{border-radius:50%;width:36px;height:36px}
+main img{width:256px;height:256px;display:block}
+main .ref img, article .uref{width:80px;height:80px}
+</style></head>
+<body><main id="chat"></main>
+<form onsubmit="return false">
+  <div id="att"></div>
+  <div class="row">
+    <input type="file" multiple accept="image/*" hidden id="imginput">
+    <input type="file" multiple hidden id="anyinput">
+    <textarea class="fallback" name="prompt-textarea" placeholder="Ask anything"></textarea>
+    <div contenteditable="true" class="ProseMirror" id="prompt-textarea" translate="no"><p><br></p></div>
+    <span id="btnslot"></span>
+  </div>
+</form>
+<script>
+// ── Имитация ChatGPT ──
+const ed = document.getElementById('prompt-textarea'), slot = document.getElementById('btnslot'), chat = document.getElementById('chat'), att = document.getElementById('att');
+let n = 0, uploading = 0, pending = [];
+const text = () => ed.innerText.replace(/ /g, ' ').trim();
+let genState = false;
+function render(state) {
+  if (state === undefined && genState) state = 'gen';
+  if (state === 'gen') slot.innerHTML = '<button type="button" data-testid="stop-button" aria-label="Stop streaming">■</button>';
+  else if (text() || pending.length) slot.innerHTML = `<button type="button" id="composer-submit-button" data-testid="send-button" aria-label="Send prompt" ${uploading ? 'disabled' : ''}>↑</button>`;
+  else slot.innerHTML = '<button type="button" aria-label="Start voice mode">🎙</button>';
+}
+function addFiles(list) {
+  for (const f of list) {
+    pending.push(f); uploading++;
+    const chip = document.createElement('div'); chip.className = 'chip';
+    chip.innerHTML = /^image\//.test(f.type) ? `<img src="${URL.createObjectURL(f)}">` : `📄 ${f.name}`;
+    att.append(chip);
+    setTimeout(() => { uploading--; render(); }, 1500); // «загрузка» 1,5 с
+  }
+  render();
+}
+['imginput', 'anyinput'].forEach(id => document.getElementById(id).addEventListener('change', e => addFiles([...e.target.files])));
+ed.addEventListener('paste', e => { e.preventDefault(); if (location.search.includes('nopaste')) return;
+  if (e.clipboardData.files.length) { addFiles([...e.clipboardData.files]); return; }
+  const t = e.clipboardData.getData('text/plain');
+  ed.innerHTML = t.split('\n').map(l => `<p>${l || '<br>'}</p>`).join(''); render(); });
+// Имитация меню «@»: файлы библиотеки — как у настоящего ChatGPT по отчётам:
+// сначала «Поиск…», результаты приходят с задержкой; ?plainmenu — без role/listbox;
+// ?slowonly — если имя вставлено куском, меню показывает «Поиск…» и исчезает;
+// Enter без открытого меню ОТПРАВЛЯЕТ сообщение (это и надо не допустить).
+const LIB = ['photo_01', 'photo_02', 'logo_main'];
+const plain = location.search.includes('plainmenu'), slowOnly = location.search.includes('slowonly');
+let menu = null, menuTimer = null, lastLen = 0;
+function closeMenu() { clearTimeout(menuTimer); if (menu) { menu.remove(); menu = null; } }
+function showMenu(html) {
+  if (!menu) {
+    menu = document.createElement('div'); if (!plain) menu.setAttribute('role', 'listbox');
+    menu.style.cssText = 'position:fixed;left:40px;bottom:90px;background:#3a3a3a;border-radius:12px;padding:6px;min-width:200px;z-index:50';
+    document.body.append(menu);
+    menu.addEventListener('click', e => { const o = e.target.closest('[role=option], .mi'); if (o) pick(o.dataset.n); });
+  }
+  menu.innerHTML = html;
+}
+function updateMenu() {
+  const txt = ed.innerText.replace(/ /g, ' ');
+  const delta = txt.trim().length - lastLen; lastLen = txt.trim().length;
+  const m = txt.match(/@(\S*)\s*$/);
+  if (!m) { closeMenu(); return; }
+  clearTimeout(menuTimer);
+  showMenu('<div style="padding:6px 10px;opacity:.6">Поиск…</div>');
+  if (slowOnly && delta > 1) { menuTimer = setTimeout(closeMenu, 600); return; }
+  const q = m[1].toLowerCase();
+  menuTimer = setTimeout(() => {
+    const items = LIB.filter(n => n.includes(q));
+    if (!items.length) { closeMenu(); return; }
+    showMenu(items.map(n => `<div ${plain ? 'class="mi"' : 'role="option" tabindex="-1"'} style="padding:6px 10px;cursor:pointer" data-n="${n}">🖼 ${n}.png</div>`).join(''));
+  }, 700);
+}
+function pick(n) {
+  if (plain) { closeMenu(); setTimeout(() => pick2(n), 1500); return; } // вложение появляется с задержкой
+  pick2(n);
+}
+function pick2(n) {
+  // убрать «@текст» из поля и добавить чип + превью файла
+  const t = ed.innerText.replace(/@\S*\s*$/, '');
+  ed.innerHTML = `<p><span contenteditable="false" data-mention="1" style="background:#1d4d3f;border-radius:6px;padding:0 6px">@${n}</span>&nbsp;${t ? t : ''}</p>`;
+  const c = document.createElement('canvas'); c.width = c.height = 40; c.getContext('2d').fillStyle = '#c33'; c.getContext('2d').fillRect(0,0,40,40);
+  const chip = document.createElement('div'); chip.className = 'chip'; chip.innerHTML = `<img src="${c.toDataURL()}"> ${n}`; att.append(chip);
+  pending.push({ name: n + '.png', type: 'image/png', lib: true }); window.__libPicked = (window.__libPicked || 0) + 1;
+  closeMenu(); render();
+  const r = document.createRange(); r.selectNodeContents(ed); r.collapse(false); const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+}
+ed.addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  const o = menu && menu.querySelector('[role=option], .mi');
+  if (o) { pick(o.dataset.n); return; }
+  if (!menu && text()) { window.__blindSend = (window.__blindSend || 0) + 1; send(); } // Enter вслепую = отправка в чат
+});
+ed.addEventListener('input', () => { updateMenu(); render(); });
+slot.addEventListener('click', e => { const b = e.target.closest('[data-testid="send-button"]'); if (b && !b.disabled) send(); });
+function send() {
+  const t = text(); ed.innerHTML = '<p><br></p>'; n++;
+  const files = pending.map(f => f.lib ? `<div>🖼 @${f.name}</div>` : /^image\//.test(f.type) ? `<img class="uref" src="${URL.createObjectURL(f)}">` : `<div>📄 ${f.name}</div>`).join('');
+  window.__sent = (window.__sent || []).concat([{ text: t.slice(0, 40), files: pending.map(f => f.name) }]);
+  pending = []; att.innerHTML = '';
+  chat.insertAdjacentHTML('beforeend', `<article data-testid="conversation-turn-${2*n-1}" data-turn="user"><div data-message-author-role="user">${t.slice(0,80)}</div>${files}</article>`);
+  genState = true; render('gen');
+  const a = document.createElement('article'); a.dataset.testid = 'conversation-turn-' + (2*n); a.dataset.turn = 'assistant';
+  a.innerHTML = '<div data-message-author-role="assistant">Creating image</div>'; chat.append(a);
+  setTimeout(() => {
+    const c = document.createElement('canvas'); c.width = c.height = 512; const g = c.getContext('2d');
+    g.fillStyle = `hsl(${n*70},60%,45%)`; g.fillRect(0,0,512,512); g.fillStyle='#fff'; g.font='bold 120px sans-serif'; g.fillText('#'+n, 150, 300);
+    a.innerHTML = `<div data-message-author-role="assistant">Image created</div><img src="${c.toDataURL()}">`;
+    genState = false; render();
+  }, 3000);
+}
+render();
+
+// ── Заглушка chrome.* ──
+const store = {}; window.__downloads = [];
+window.chrome = { storage: { local: { get: async k => ({ [k]: store[k] }), set: async o => Object.assign(store, o) } },
+  runtime: { id: 'mock', connect: () => { const l = [], d = []; window.__ticks = 0;
+      const t = setInterval(() => { window.__ticks++; l.forEach(f => f('tick')); }, 500);
+      return { onMessage: { addListener: f => l.push(f) }, onDisconnect: { addListener: f => d.push(f) },
+        postMessage() {}, disconnect() { clearInterval(t); } }; },
+    onMessage: { addListener() {} }, sendMessage: async m => { __downloads.push(m.filename); return { ok: true }; } } };
+store.cgptBatch = { text: 'кот в скафандре на Луне\nзакат над горами, акварель\nлоготип кофейни', delayMin: 1, delayMax: 1, logOpen: true,
+  names: ['gpt_mock_01', 'gpt_mock_02', 'gpt_mock_03'], refs: ['01_slide1_bus.png', '02_slide2_bus3.png', ''] };
+</script><script src="content.js"></script></body></html>
