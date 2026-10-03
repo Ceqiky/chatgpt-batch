@@ -105,7 +105,7 @@ DO NOT: add any new element, text or decoration; move, resize, restyle, recolour
 
 RESULT: the same scene, isolated on a clean pure black background — only the objects, their lines and arrows, shadows and native glow — ready for compositing with the Screen blend mode. Clean edges, no dark halo or grey fringe around objects.`,
     editSuffix: '_black', followUp: false, editOpen: false,
-    libMode: false, libName: '', prepAhead: true, notify: true,
+    libName: '', notify: true,
     open: true, settingsOpen: false, logOpen: true, pos: null,
   };
   let S = { ...DEFAULTS };
@@ -147,12 +147,25 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   });
 
   // ─── Разбор промптов ───
+  // Результат кешируется: панель спрашивает список промптов на каждое нажатие клавиши
+  let promptsCache = { text: null, sep: null, out: [] };
   function parsePrompts(text, sep) {
+    if (text === promptsCache.text && sep === promptsCache.sep) return promptsCache.out;
     let parts;
     if (sep === 'blank') parts = text.split(/\r?\n\s*\r?\n/);
     else if (sep === 'dash') parts = text.split(/^\s*-{3,}\s*$/m);
     else parts = text.split(/\r?\n/);
-    return parts.map((s) => s.trim()).filter(Boolean);
+    const out = parts.map((s) => s.trim()).filter(Boolean);
+    promptsCache = { text, sep, out };
+    return out;
+  }
+
+  // «@IMG_4811 @logo /paparazzi» → файлы из библиотеки ChatGPT + текст промпта.
+  // Берутся только «@имя» в самом начале, чтобы не цеплять «@» внутри текста.
+  function splitLibRefs(text) {
+    const m = text.match(/^\s*((?:@[^\s@]+(?:\s+|$))+)/);
+    if (!m) return { refs: [], text: text.trim() };
+    return { refs: m[1].trim().split(/\s+/).map((s) => s.slice(1)), text: text.slice(m[0].length).trim() };
   }
 
   function parseCSV(text) {
@@ -245,7 +258,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   function lastTurnText() {
     const turns = $$(SEL.turn);
     const el = turns[turns.length - 1] || $$(SEL.msg).pop();
-    return el ? el.innerText : '';
+    return el ? el.textContent || '' : ''; // textContent не заставляет браузер пересчитывать вёрстку
   }
 
   function imagePending(before) {
@@ -277,7 +290,13 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     const seen = new Set();
     return SEL.inputList.flatMap((s) => $$(s)).filter((el) => !seen.has(el) && seen.add(el));
   }
-  const findInput = () => inputCandidates().find(isVisible) || null;
+  // Поле ввода запоминаем: искать его заново (7 селекторов + стили) нужно, только если ChatGPT его перерисовал
+  let inputCache = null;
+  const findInput = () => {
+    if (inputCache && inputCache.isConnected && isVisible(inputCache)) return inputCache;
+    inputCache = inputCandidates().find(isVisible) || null;
+    return inputCache;
+  };
   const inputText = (el) => (el ? (el.tagName === 'TEXTAREA' ? el.value : el.innerText) : '');
 
   function sendCandidates() {
@@ -448,48 +467,60 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     if (n) dbg(`Убрал старых вложений из поля: ${n}`);
     return n;
   }
-  // Имя файла без случайного «@» в начале (в поле его вводить не нужно — расширение добавляет само)
+  // Файл из библиотеки для всех промптов. Пустое поле — не используется (переключателя нет:
+  // одно состояние вместо двух, их нельзя рассинхронизировать). «@» в начале убирается.
   const libNameClean = () => (S.libName || '').trim().replace(/^@+/, '').trim();
 
-  // Видимый текст страницы вне поля ввода и нашей панели: разметка меню ChatGPT нам неизвестна,
-  // поэтому пункт меню ищем по тексту — в нём должно быть имя файла.
-  function textNodesVisible(filter) {
-    const ed = findInput();
-    const out = [];
-    const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    for (let t; (t = w.nextNode());) {
-      const s = t.nodeValue;
-      if (!s || !s.trim()) continue;
-      const p = t.parentElement;
-      if (!p || host.contains(p) || (ed && ed.contains(p))) continue;
-      if (p.closest('script, style, noscript')) continue;
-      if (filter && !filter(s)) continue;
-      if (!isVisible(p)) continue;
-      out.push(p);
+  // Меню «@» ищем только среди того, что ПОЯВИЛОСЬ на странице после ввода, — а не обходим
+  // весь чат каждые 0,1 с (на длинном чате это ~36 тыс. узлов и заметно тормозило страницу).
+  function watchAdded() {
+    const roots = new Set();
+    const mo = new MutationObserver((list) => {
+      for (const m of list) {
+        if (m.type === 'characterData') { if (m.target.parentElement) roots.add(m.target.parentElement); continue; }
+        for (const n of m.addedNodes) {
+          const e = n.nodeType === 1 ? n : n.parentElement;
+          if (e) roots.add(e);
+        }
+      }
+    });
+    mo.observe(document.body, { childList: true, subtree: true, characterData: true });
+    return { roots, stop: () => mo.disconnect() };
+  }
+  // Пункты с именем файла внутри появившихся элементов (не в поле ввода, не в чате, не в панели)
+  function entriesIn(roots, name) {
+    const n = labelKey(name), ed = findInput(), out = [];
+    for (const r of roots) {
+      if (!r.isConnected || host.contains(r) || (ed && (ed.contains(r) || r.contains(ed)))) continue;
+      if (r.closest(`${SEL.turn}, [data-message-author-role]`)) continue;
+      if (!labelKey(r.textContent || '').includes(n)) continue; // быстрый отсев без обхода
+      const w = document.createTreeWalker(r, NodeFilter.SHOW_TEXT);
+      for (let t; (t = w.nextNode());) {
+        const p = t.parentElement;
+        if (p && labelKey(t.nodeValue).includes(n) && !(ed && ed.contains(p)) && isVisible(p)) out.push(p);
+      }
     }
     return out;
   }
-  const findNameEntries = (name) => {
-    const n = labelKey(name);
-    // Исключаем уже отправленные сообщения чата: пункт меню — не там
-    return textNodesVisible((s) => labelKey(s).includes(n))
-      .filter((p) => !p.closest(`${SEL.turn}, [data-message-author-role]`));
-  };
   const clickTarget = (el) => el.closest('[role="option"], [role="menuitem"], [cmdk-item], button, a, li, [tabindex], [class*="cursor-pointer"]') || el;
-  const visibleTexts = () => new Set(textNodesVisible((s) => s.trim().length <= 80).map((p) => norm(p.textContent).slice(0, 80)));
 
   // Какой способ ввода «@» у тебя работает — запоминаем, чтобы в следующий раз не пробовать лишнее
   let libStrategy = 'chunk';
 
-  async function insertLibraryRef(name) {
+  // fresh=true — поле очищается перед вводом; false — «@имя» дописывается (второй файл и т.д.)
+  async function insertLibraryRef(name, fresh = true) {
     let el = findInput();
     if (!el) throw new Error('Не найдено видимое поле ввода ChatGPT');
-    clearInput(el); await sleep(60);
-    el = liveInput(el) || el;
+    if (fresh) { clearInput(el); await sleep(60); el = liveInput(el) || el; }
     const before = composerSnapshot();
-    const knownEntries = new Set(findNameEntries(name)); // совпадения, которые были на странице ДО ввода
-    const knownTexts = visibleTexts();
-    const newEntry = () => findNameEntries(name).find((e) => !knownEntries.has(e)) || null;
+    const typed = () => labelKey(inputText(el)).includes('@' + labelKey(name));
+    // Убрать недописанное «@имя», не трогая то, что было в поле до него
+    const eraseTyped = () => {
+      if (!typed()) return;
+      if (fresh) { clearInput(el); return; }
+      placeCaretEnd(el);
+      for (let k = 0; k <= name.length; k++) document.execCommand('delete', false);
+    };
 
     const waitFor = async (fn, ms) => {
       const t = Date.now();
@@ -500,50 +531,54 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
 
     // Способы набрать «@имя» (все — как ввод с клавиатуры, вставкой меню не открывается)
     const typers = {
-      // «@» отдельно, затем имя одним куском — быстро
-      chunk: async () => {
-        el.focus(); document.execCommand('insertText', false, '@'); await sleep(250);
+      chunk: async () => { // «@» отдельно, затем имя одним куском — быстро
+        el.focus(); placeCaretEnd(el);
+        document.execCommand('insertText', false, '@'); await sleep(250);
         document.execCommand('insertText', false, name);
       },
-      // «@», затем имя по символам — медленно, но как руками
-      slow: async () => {
-        el.focus(); document.execCommand('insertText', false, '@'); await sleep(350);
+      slow: async () => { // «@», затем имя по символам — медленно, но как руками
+        el.focus(); placeCaretEnd(el);
+        document.execCommand('insertText', false, '@'); await sleep(350);
         for (const ch of name) { document.execCommand('insertText', false, ch); await sleep(45); }
       },
     };
     const order = libStrategy === 'slow' ? ['slow'] : ['chunk', 'slow'];
+    const seenTexts = new Set();
 
     for (const strategy of order) {
-      clearInput(el); await sleep(120);
+      eraseTyped(); await sleep(100);
       el = liveInput(el) || el;
-      await typers[strategy]();
-
-      // Enter НЕ нажимаем, пока в меню не появился пункт с именем файла:
-      // без открытого меню Enter отправил бы в чат сообщение «@имя».
-      const entry = await waitFor(newEntry, strategy === 'slow' ? 9000 : 4000);
-      if (!entry) { dbg(`Способ «${strategy}»: пункт меню с именем «${name}» не появился`); continue; }
-      dbg(`Способ «${strategy}»: пункт меню найден «${norm(entry.textContent).slice(0, 60)}»`);
-      await sleep(150); // дать меню дорисоваться
-      fireClick(clickTarget(entry));
-      let attached = await waitAttached(6000);
-      if (!attached && newEntry()) { // меню всё ещё открыто — подтверждаем Enter-ом (безопасно, меню на месте)
-        dbg('Клик не подтвердился, меню открыто — жму Enter');
-        pressKey(el, 'Enter', 'Enter', 13);
-        attached = await waitAttached(4000);
+      const watch = watchAdded();
+      try {
+        await typers[strategy]();
+        // Enter НЕ нажимаем, пока в меню не появился пункт с именем файла:
+        // без открытого меню Enter отправил бы в чат сообщение «@имя».
+        const entry = await waitFor(() => entriesIn(watch.roots, name)[0], strategy === 'slow' ? 9000 : 4000);
+        for (const r of watch.roots) if (r.isConnected && !host.contains(r)) seenTexts.add(norm(r.textContent).slice(0, 60));
+        if (!entry) { dbg(`Способ «${strategy}»: пункт меню с именем «${name}» не появился`); continue; }
+        dbg(`Способ «${strategy}»: пункт меню найден «${norm(entry.textContent).slice(0, 60)}»`);
+        await sleep(150); // дать меню дорисоваться
+        fireClick(clickTarget(entry));
+        let attached = await waitAttached(6000);
+        if (!attached && entriesIn(watch.roots, name).length) { // меню всё ещё открыто — Enter безопасен
+          dbg('Клик не подтвердился, меню открыто — жму Enter');
+          pressKey(el, 'Enter', 'Enter', 13);
+          attached = await waitAttached(4000);
+        }
+        if (attached) {
+          libStrategy = strategy;
+          dbg(`Файл «${name}» выбран из библиотеки (способ «${strategy}»)`);
+          return el;
+        }
+        dbg(`Способ «${strategy}»: пункт найден, но файл не прикрепился`);
+      } finally {
+        watch.stop();
       }
-      if (attached) {
-        libStrategy = strategy;
-        dbg(`Файл «${name}» выбран из библиотеки (способ «${strategy}»)`);
-        return el;
-      }
-      dbg(`Способ «${strategy}»: пункт найден, но файл не прикрепился`);
     }
 
-    // Не вышло: убираем за собой недописанный «@имя», чтобы он случайно не ушёл в чат
-    clearInput(el);
-    el = liveInput(el) || el;
-    const appeared = [...visibleTexts()].filter((t) => !knownTexts.has(t)).slice(0, 40);
-    dbg('Ссылка из библиотеки не сработала', { newTextsOnPage: appeared, ...diag() });
+    // Не вышло: убираем недописанный «@имя», чтобы он случайно не ушёл в чат
+    eraseTyped();
+    dbg('Ссылка из библиотеки не сработала', { appearedOnPage: [...seenTexts].filter(Boolean).slice(0, 30), ...diag() });
     throw new Error(`не удалось выбрать «${name}» из библиотеки (@)`);
   }
 
@@ -731,7 +766,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     if (!root) return { imgs: 0, text: '' };
     const ed = findInput();
     const imgs = $$('img', root).filter((i) => !ed || !ed.contains(i)).length;
-    return { imgs, text: (root.innerText || '').toLowerCase() };
+    return { imgs, text: (root.textContent || '').toLowerCase() };
   }
   // Файл появился среди вложений? Картинка — новое превью, документ — его имя в поле
   function fileAppeared(file, before) {
@@ -1002,36 +1037,9 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   const pad3 = (n) => String(n).padStart(3, '0');
   const stemOf = (name) => (name || '').replace(/\.[a-z0-9]{2,5}$/i, '');
 
-  // Одна отправка с повторами: прикрепить → вставить → отправить → дождаться → скачать.
-  // job: { num, label, text, attach: () => File[], name }
-  let prepared = null; // { job, useLib, att } — следующий промпт, уже введённый в поле
-
-  async function prepareNext(job) {
-    prepared = null;
-    try {
-      setStatus('gen', 'Готовлю следующий, пока идёт генерация');
-      const att = job.attach ? job.attach() : [];
-      const inp = findInput();
-      if (inp) { clearInput(inp); await clearAttachments(); }
-      if (att.length) await attachFiles(att);
-      const useLib = !!(job.useLib && S.libMode && libNameClean());
-      if (useLib) await insertLibraryRef(libNameClean());
-      await typePrompt(job.text, useLib);
-      prepared = { job, useLib, att };
-      dbg(`${job.label} подготовлен заранее`);
-    } catch (e) {
-      if (e.message === 'STOP') throw e;
-      dbg(`Подготовка заранее не вышла (${e.message}) — подготовлю после генерации`);
-      const inp = findInput();
-      if (inp) clearInput(inp);
-      prepared = null;
-    }
-  }
-
   // После остановки / ошибки / конца: убрать из поля ввода всё, что осталось от нас —
-  // заготовку следующего промпта, «@файл» и превью вложений (иначе их легко отправить случайно)
+  // недописанный промпт, «@файл» и превью вложений (иначе их легко отправить случайно)
   async function cleanupComposer() {
-    prepared = null;
     try {
       const el = findInput();
       if (!el) return;
@@ -1040,8 +1048,16 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     } catch { /* страница могла измениться — не критично */ }
   }
 
-  async function runJob(job, next) {
+  // Одна отправка с повторами. Каждая попытка начинается с чистого поля, поэтому никакое
+  // промежуточное состояние (пауза, стоп, ошибка) не переносится на следующую попытку.
+  // job: { num, label, text, attach: () => File[], name, useLib }
+  async function runJob(job) {
     let limitWaits = 0;
+    // Файлы из библиотеки: «@имя» в начале промпта, а если их нет — общий из поля «Файл из библиотеки»
+    const split = job.useLib ? splitLibRefs(job.text) : { refs: [], text: job.text };
+    const libRefs = !job.useLib ? [] : split.refs.length ? [...new Set(split.refs)] : [libNameClean()].filter(Boolean);
+    const text = split.text;
+
     for (let attempt = 0; attempt <= S.retries; attempt++) {
       if (attempt > 0) {
         log(`${job.label}: повтор ${attempt} из ${S.retries}`, 'warn');
@@ -1052,19 +1068,13 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       const before = new Set(allImgs().map(srcOf));
       const turns = countTurns();
 
-      let att = job.attach ? job.attach() : [];
-      let el = null;
-      // Поле уже заполнено заранее (пока шла прошлая генерация) — просто проверяем и отправляем
-      const pre = attempt === 0 && prepared && prepared.job === job ? prepared : null;
-      prepared = null;
-      const preEl = pre ? findInput() : null;
-      if (pre && preEl && (pre.useLib ? keepMatches(preEl, job.text) : textMatches(preEl, job.text))) {
-        att = pre.att; el = preEl;
-        log(`${job.label}: подготовлен заранее`, 'info');
-      }
+      // 1) Чистое поле: убираем текст и вложения, оставшиеся от прошлой попытки
       const inp = findInput();
-      if (inp && !el) { clearInput(inp); await clearAttachments(); } // остатки прошлой попытки (в т.ч. «@файл») убираем
-      if (!el && att.length) {
+      if (inp) { clearInput(inp); await clearAttachments(); }
+
+      // 2) Вложения с компьютера (Word, референсы)
+      const att = job.attach ? job.attach() : [];
+      if (att.length) {
         setStatus('gen', `Прикрепляю файлы (${att.length})`);
         try { await attachFiles(att); } catch (e) {
           if (e.message === 'STOP') throw e;
@@ -1073,42 +1083,45 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
         log(`${job.label}: прикреплено — ${att.map((f) => f.name).join(', ')}`, 'info');
       }
 
-      const useLib = !!(job.useLib && S.libMode && libNameClean());
-      if (!el && useLib) {
-        setStatus('gen', 'Файл из библиотеки (@)');
-        try { await insertLibraryRef(libNameClean()); } catch (e) {
+      // 3) Файлы из библиотеки ChatGPT через «@»
+      let libOk = true;
+      for (let k = 0; k < libRefs.length; k++) {
+        setStatus('gen', `Файл из библиотеки: @${libRefs[k]}`);
+        try { await insertLibraryRef(libRefs[k], k === 0); } catch (e) {
           if (e.message === 'STOP') throw e;
-          log(`${job.label}: ${e.message}`, 'err'); continue;
+          log(`${job.label}: ${e.message}`, 'err'); libOk = false; break;
         }
-        log(`${job.label}: @${libNameClean()} из библиотеки`, 'info');
       }
+      if (!libOk) continue;
+      if (libRefs.length) log(`${job.label}: из библиотеки — ${libRefs.map((n) => '@' + n).join(', ')}`, 'info');
 
-      if (!el) {
+      // 4) Текст промпта (после «@файлов» — дописываем, не стирая их)
+      let el = findInput();
+      if (text) {
         setStatus('gen', 'Вставка промпта');
-        try { el = await typePrompt(job.text, useLib); } catch (e) {
+        try { el = await typePrompt(text, libRefs.length > 0); } catch (e) {
           if (e.message === 'STOP') throw e;
           log(`${job.label}: ${e.message}`, 'err'); continue;
         }
       }
-      setStatus('gen', 'Отправка');
-      if (!(await clickSend(el, turns, att.length ? 180000 : 10000))) { log(`${job.label}: не удалось нажать «Отправить»`, 'err'); continue; }
-      log(`${job.label} отправлен`, 'info');
 
-      // Пока ChatGPT генерирует эту картинку, заранее готовим следующий промпт
-      if (S.prepAhead && next) await prepareNext(next);
+      // 5) Отправка и ожидание
+      setStatus('gen', 'Отправка');
+      const sendWait = att.length ? 180000 : libRefs.length ? 60000 : 10000;
+      if (!(await clickSend(el, turns, sendWait))) { log(`${job.label}: не удалось нажать «Отправить»`, 'err'); continue; }
+      log(`${job.label} отправлен`, 'info');
 
       const r = await waitDone(before, turns);
       if (!r.ok && r.limit && limitWaits < 12) {
         // Лимит — не ошибка промпта: ждём и повторяем, попытка не тратится
         limitWaits++;
-        const inp2 = findInput(); if (inp2) clearInput(inp2); // убрать заготовку следующего, она пересоберётся
-        prepared = null;
         await waitLimit(r.limit, job.label);
         attempt--;
         continue;
       }
       if (!r.ok) { log(`${job.label}: ${r.reason}`, 'err'); continue; }
 
+      // 6) Результат
       if (!S.waitImage) { log(`${job.label} готово`, 'ok'); return { ok: true, imgs: 0 }; }
       const imgs = newImages(before).filter(imgUsable);
       if (!imgs.length) { log(`${job.label}: картинка не появилась`, 'err'); continue; }
@@ -1151,16 +1164,9 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       }));
     }
     if (!findInput()) { flash('Поле ввода ChatGPT не найдено — нажмите «Проверить поле»'); dbg('Старт: поле не найдено', diag()); return; }
-    // Имя файла из библиотеки указано, а режим выключен — иначе промпты тихо уйдут без картинки
-    if (!isEdit && libNameClean() && !S.libMode &&
-        !confirm(`Указан файл из библиотеки «${libNameClean()}», но переключатель «Из библиотеки ChatGPT» выключен.\n\nЗапустить промпты БЕЗ этого файла?`)) {
-      flash('Включите «Из библиотеки ChatGPT» и запустите снова');
-      return;
-    }
     dbg('Старт', diag());
 
     run.active = true; run.paused = false; run.stop = false;
-    prepared = null;
     startTicker();
     updateButtons();
     let i = isEdit ? 0 : Math.min(Math.max(0, (parseInt(S.startFrom, 10) || 1) - 1), jobs.length - 1);
@@ -1175,9 +1181,11 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     } else {
       if (S.refs && S.refs.length === jobs.length && S.refs.some(Boolean) && !files.refs.size) log('В CSV есть колонка референсов, но папка с ними не выбрана — промпты пойдут без референсов', 'warn');
       if (files.common.length) log(`Общие файлы: ${files.common.map((f) => f.name).join(', ')} — ${S.commonMode === 'each' ? 'к каждому промпту' : 'к первому промпту'}`, 'info');
-      // Сразу видно, будет ли у промптов картинка из библиотеки
-      if (S.libMode && libNameClean()) log(`Файл из библиотеки: @${libNameClean()} — к каждому промпту`, 'info');
-      else if (S.libMode) log('Переключатель «Из библиотеки» включён, но имя файла не указано — промпты пойдут без файла', 'warn');
+      // Сразу видно, какие промпты получат файл из библиотеки
+      const own = jobs.filter((j) => splitLibRefs(j.text).refs.length).length;
+      if (libNameClean()) log(`Файл из библиотеки: @${libNameClean()} — к ${own ? 'остальным' : 'каждому'} промпт${own ? 'ам' : 'у'}`, 'info');
+      if (own) log(`Свои файлы «@имя» указаны в ${own} ${plural(own, 'промпте', 'промптах', 'промптах')} — для них общий файл не добавляется`, 'info');
+      if (!libNameClean() && !own) log('Файлы из библиотеки не используются', 'info');
       if (followUp) log('После каждой картинки будет отправляться доработка', 'info');
       log(`Старт: ${jobs.length} промптов, начиная с №${i + 1}`, 'info');
     }
@@ -1190,8 +1198,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
         setProgress(i, jobs.length);
         setCurrent(i + 1, job.display);
 
-        // Доработка после каждой картинки идёт в тот же чат раньше следующего — заранее готовить нельзя
-        const res = await runJob(job, followUp ? null : jobs[i + 1]);
+        const res = await runJob(job);
         if (!res.ok) {
           log(`${job.label} не получился. «Продолжить» повторит его`, 'warn');
           notify('Очередь на паузе', `${job.label} не получился — нужна проверка`);
@@ -1501,13 +1508,12 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
           <div class="frow">
             <div class="fic">${I.at}</div>
             <div class="ftxt">
-              <div class="t">Из библиотеки ChatGPT</div>
-              <div class="d">Не загружать файл заново: «@имя» + выбор</div>
+              <div class="t">Файл из библиотеки ChatGPT</div>
+              <div class="d" title="Свой файл для отдельного промпта: начните промпт с @имя, например «@IMG_4811 /wideshot». Он заменяет общий файл">Ко всем промптам, без загрузки. Пусто — не нужен</div>
             </div>
-            <label class="sw"><input type="checkbox" data-k="libMode"><span></span></label>
           </div>
           <div class="frow">
-            <input class="inp" data-k="libName" placeholder="имя файла в библиотеке" spellcheck="false">
+            <input class="inp" data-k="libName" placeholder="имя файла, например IMG_4811" spellcheck="false">
             <button class="ghost" data-testlib title="Вставить @имя в поле ChatGPT без отправки">Проверить</button>
           </div>
           <input type="file" multiple hidden data-commonfile>
@@ -1568,10 +1574,6 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
             <label class="sw-row">
               <div><div class="t">Ждать картинку</div><div class="d">Считать ответ готовым, только когда картинка догрузилась</div></div>
               <span class="sw"><input type="checkbox" data-k="waitImage"><span></span></span>
-            </label>
-            <label class="sw-row">
-              <div><div class="t">Готовить следующий заранее</div><div class="d">Пока идёт генерация, уже вставлять @файл и текст следующего промпта</div></div>
-              <span class="sw"><input type="checkbox" data-k="prepAhead"><span></span></span>
             </label>
             <label class="sw-row">
               <div><div class="t">Уведомления</div><div class="d">Сообщать, когда очередь закончилась, встала на паузу или ждёт лимит</div></div>
@@ -1651,7 +1653,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
 
   function refreshFiles() {
     const [cIc, rIc, lIc] = shadow.querySelectorAll('.files .fic');
-    lIc.classList.toggle('on', !!(S.libMode && libNameClean()));
+    lIc.classList.toggle('on', !!libNameClean());
     // общие
     if (files.common.length) {
       ui.commonInfo.textContent = files.common.map((f) => f.name).join(', ');
@@ -1703,21 +1705,18 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   new MutationObserver(syncTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', syncTheme);
 
+  // Сохранение с задержкой: при наборе текста не пишем в хранилище на каждую клавишу
+  let saveTimer = 0;
+  const saveSoon = () => { clearTimeout(saveTimer); saveTimer = setTimeout(save, 400); };
+
   function readForm() {
-    const hadLibName = !!libNameClean();
     for (const f of ui.fields) {
       const k = f.dataset.k;
       if (f.type === 'checkbox') S[k] = f.checked;
       else if (f.type === 'number') S[k] = f.value === '' ? DEFAULTS[k] : Number(f.value);
       else S[k] = f.value;
     }
-    // Впечатали имя файла из библиотеки в пустое поле — режим включается сам (иначе легко забыть переключатель)
-    if (!hadLibName && libNameClean() && !S.libMode) {
-      S.libMode = true;
-      const sw = ui.fields.find((x) => x.dataset.k === 'libMode');
-      if (sw) sw.checked = true;
-    }
-    save();
+    saveSoon();
     refreshInfo();
   }
   function fillForm() {
@@ -1902,15 +1901,17 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     if (!name) { flash('Впишите имя файла из библиотеки'); return; }
     const btn = ui.testLib;
     btn.disabled = true;
+    startTicker(); // в скрытой вкладке таймеры иначе замедляются до раза в секунду
     try {
       log(`Проверка @${name}…`, 'info');
+      const t0 = Date.now();
       await clearAttachments(); // старое превью от прошлой проверки мешает выбору файла
       await insertLibraryRef(name);
-      log(`✓ «${name}» выбран из библиотеки — ссылка вставилась в поле ChatGPT`, 'ok');
+      log(`✓ «${name}» выбран из библиотеки за ${((Date.now() - t0) / 1000).toFixed(1)} с`, 'ok');
       log('Тест ничего не отправлял. Уберите превью в поле ввода крестиком, если оно появилось', 'info');
     } catch (e) {
       log(`✗ ${e.message}. Нажмите «Копировать отчёт» и пришлите его`, 'err');
-    } finally { btn.disabled = false; }
+    } finally { btn.disabled = false; if (!run.active) stopTicker(); }
   });
 
   // Референсы из Word-ТЗ: картинки из строк таблицы
