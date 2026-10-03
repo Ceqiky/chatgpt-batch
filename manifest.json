@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Batch Prompter",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Отправляет промпты в ChatGPT по очереди, ждёт окончания генерации и скачивает картинки.",
   "permissions": ["storage", "downloads", "scripting", "notifications"],
   "icons": { "128": "icon.png" },

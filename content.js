@@ -1151,6 +1151,12 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       }));
     }
     if (!findInput()) { flash('Поле ввода ChatGPT не найдено — нажмите «Проверить поле»'); dbg('Старт: поле не найдено', diag()); return; }
+    // Имя файла из библиотеки указано, а режим выключен — иначе промпты тихо уйдут без картинки
+    if (!isEdit && libNameClean() && !S.libMode &&
+        !confirm(`Указан файл из библиотеки «${libNameClean()}», но переключатель «Из библиотеки ChatGPT» выключен.\n\nЗапустить промпты БЕЗ этого файла?`)) {
+      flash('Включите «Из библиотеки ChatGPT» и запустите снова');
+      return;
+    }
     dbg('Старт', diag());
 
     run.active = true; run.paused = false; run.stop = false;
@@ -1169,6 +1175,9 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     } else {
       if (S.refs && S.refs.length === jobs.length && S.refs.some(Boolean) && !files.refs.size) log('В CSV есть колонка референсов, но папка с ними не выбрана — промпты пойдут без референсов', 'warn');
       if (files.common.length) log(`Общие файлы: ${files.common.map((f) => f.name).join(', ')} — ${S.commonMode === 'each' ? 'к каждому промпту' : 'к первому промпту'}`, 'info');
+      // Сразу видно, будет ли у промптов картинка из библиотеки
+      if (S.libMode && libNameClean()) log(`Файл из библиотеки: @${libNameClean()} — к каждому промпту`, 'info');
+      else if (S.libMode) log('Переключатель «Из библиотеки» включён, но имя файла не указано — промпты пойдут без файла', 'warn');
       if (followUp) log('После каждой картинки будет отправляться доработка', 'info');
       log(`Старт: ${jobs.length} промптов, начиная с №${i + 1}`, 'info');
     }
@@ -1695,11 +1704,18 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', syncTheme);
 
   function readForm() {
+    const hadLibName = !!libNameClean();
     for (const f of ui.fields) {
       const k = f.dataset.k;
       if (f.type === 'checkbox') S[k] = f.checked;
       else if (f.type === 'number') S[k] = f.value === '' ? DEFAULTS[k] : Number(f.value);
       else S[k] = f.value;
+    }
+    // Впечатали имя файла из библиотеки в пустое поле — режим включается сам (иначе легко забыть переключатель)
+    if (!hadLibName && libNameClean() && !S.libMode) {
+      S.libMode = true;
+      const sw = ui.fields.find((x) => x.dataset.k === 'libMode');
+      if (sw) sw.checked = true;
     }
     save();
     refreshInfo();
