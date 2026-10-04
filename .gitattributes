@@ -1,0 +1,3 @@
+# Единые переносы строк (LF) на Windows и macOS
+* text=auto eol=lf
+*.png binary
