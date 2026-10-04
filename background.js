@@ -77,16 +77,45 @@ chrome.notifications.onClicked.addListener(async (id) => {
   } catch { /* вкладку могли закрыть */ }
 });
 
-// Скачивание картинок по запросу из content.js
+// Скачивание по запросу из content.js. Ответ приходит, только когда файл РЕАЛЬНО сохранён
+// (или загрузка оборвалась) — раньше «ок» отправлялось на старте, и сбои терялись.
+// conflictAction: 'overwrite' — повторная загрузка с тем же именем заменяет файл, а не плодит «имя (1).png».
+const dlWaiters = new Map(); // id → функция, которой сообщаем итог
+chrome.downloads.onChanged.addListener((d) => {
+  const cur = d.state && d.state.current;
+  if (cur !== 'complete' && cur !== 'interrupted') return;
+  const w = dlWaiters.get(d.id);
+  if (!w) return;
+  dlWaiters.delete(d.id);
+  w(cur === 'complete' ? { ok: true } : { ok: false, error: (d.error && d.error.current) || 'загрузка прервана' });
+});
+
+function downloadAndWait(url, filename) {
+  return new Promise((resolve) => {
+    chrome.downloads.download({ url, filename, conflictAction: 'overwrite', saveAs: false }, (id) => {
+      if (chrome.runtime.lastError || id === undefined) {
+        resolve({ ok: false, error: (chrome.runtime.lastError && chrome.runtime.lastError.message) || 'не удалось начать загрузку' });
+        return;
+      }
+      const finish = (res) => {
+        clearTimeout(timer);
+        chrome.downloads.search({ id }, (items) => resolve({ ...res, id, filename: items && items[0] && items[0].filename }));
+      };
+      const timer = setTimeout(() => { dlWaiters.delete(id); finish({ ok: false, error: 'таймаут загрузки (90 с)' }); }, 90000);
+      dlWaiters.set(id, finish);
+      // Загрузка могла завершиться раньше, чем мы подписались
+      chrome.downloads.search({ id }, (items) => {
+        const st = items && items[0] && items[0].state;
+        if (st === 'complete' && dlWaiters.has(id)) { dlWaiters.delete(id); finish({ ok: true }); }
+        else if (st === 'interrupted' && dlWaiters.has(id)) { dlWaiters.delete(id); finish({ ok: false, error: items[0].error || 'загрузка прервана' }); }
+      });
+    });
+  });
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === 'download') {
-    chrome.downloads.download(
-      { url: msg.url, filename: msg.filename, conflictAction: 'uniquify', saveAs: false },
-      (id) => {
-        if (chrome.runtime.lastError) sendResponse({ ok: false, error: chrome.runtime.lastError.message });
-        else sendResponse({ ok: true, id });
-      }
-    );
+    downloadAndWait(msg.url, msg.filename).then(sendResponse);
     return true; // ответ асинхронный
   }
 });

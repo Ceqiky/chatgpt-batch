@@ -105,7 +105,8 @@ DO NOT: add any new element, text or decoration; move, resize, restyle, recolour
 
 RESULT: the same scene, isolated on a clean pure black background — only the objects, their lines and arrows, shadows and native glow — ready for compositing with the Screen blend mode. Clean edges, no dark halo or grey fringe around objects.`,
     editSuffix: '_black', followUp: false, editOpen: false,
-    libName: '', notify: true,
+    libName: '', notify: true, skipFailed: true, perRunFolder: true,
+    runFolder: '', csvName: '', failed: [], resultsMap: {},
     open: true, settingsOpen: false, logOpen: true, pos: null,
   };
   let S = { ...DEFAULTS };
@@ -907,8 +908,8 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
 
   // ─── Лимиты ChatGPT и уведомления ───
   const LIMIT_RE = /(too many (requests|images)|rate limit|reached (the |your )?(current )?(usage |daily |hourly )?(cap|limit)|usage cap|image generation limit|слишком много запросов|достигли (текущего )?лимита|достигнут лимит|лимит[^.]{0,40}(исчерпан|достигнут)|повторите попытку|попробуйте (снова|позже|ещё раз|еще раз) через|try again (later|in))/i;
-  function limitText() {
-    const parts = [lastTurnText()];
+  function limitText(assistBefore = 0) {
+    const parts = assistCount() > assistBefore ? [lastTurnText()] : [];
     for (const e of $$('[role="alert"], [role="dialog"], [role="status"], [data-testid*="toast" i], [class*="toast" i]')) {
       if (isVisible(e) && !host.contains(e)) parts.push(e.innerText || '');
     }
@@ -922,10 +923,22 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     const mult = /^(сек|sec)/.test(u) ? 1000 : /^(мин|min)/.test(u) ? 60000 : 3600000;
     return Math.round(n * mult) + 5000;
   }
-  function detectLimit() {
-    const t = limitText(), m = t.match(LIMIT_RE);
+  function detectLimit(assistBefore = 0) {
+    const t = limitText(assistBefore), m = t.match(LIMIT_RE);
     if (!m) return null;
     return { text: norm(t.slice(Math.max(0, m.index - 30), m.index + 150)), waitMs: parseWaitMs(t.slice(m.index)) };
+  }
+  // Отказ по правилам контента: «Нам очень жаль, но ваш запрос может нарушать наши правила…»
+  const REFUSAL_RE = /(нарушать наши правила|правила использования контента|нарушает правила|may violate (our )?(content )?polic|violat\w* (our )?(content )?polic|content polic|can[’']?t (help|assist|create|generate)[^.]{0,50}(that|this|request|image)|не могу (создать|сгенерировать|помочь|выполнить))/i;
+  const assistCount = () => $$('[data-message-author-role="assistant"]').length;
+  // assistBefore — сколько ответов было до отправки: без этого можно принять за новый отказ ответ на ПРОШЛЫЙ промпт
+  function detectRefusal(assistBefore = 0) {
+    // Только ответ ассистента: в сообщении пользователя (наш промпт) такие слова ничего не значат
+    const answers = $$('[data-message-author-role="assistant"]');
+    if (answers.length <= assistBefore) return null;
+    const t = answers[answers.length - 1].textContent || '';
+    const m = t.match(REFUSAL_RE);
+    return m ? norm(t.slice(Math.max(0, m.index - 20), m.index + 140)) : null;
   }
   async function waitLimit(lim, label) {
     const ms = Math.min(Math.max(lim.waitMs, 10000), 3 * 3600000);
@@ -940,7 +953,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     try { chrome.runtime.sendMessage({ type: 'notify', title, message }).catch(() => {}); } catch { /* контекст недействителен */ }
   }
 
-  async function waitDone(before, turnsBefore) {
+  async function waitDone(before, turnsBefore, assistBefore = 0) {
     const t0 = Date.now();
     const timeout = Math.max(1, +S.timeoutMin) * 60000;
 
@@ -952,8 +965,10 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       await sleep(500);
     }
     if (!started) {
-      const lim = detectLimit();
+      const lim = detectLimit(assistBefore);
       if (lim) return { ok: false, limit: lim, reason: 'лимит ChatGPT' };
+      const ref = detectRefusal(assistBefore);
+      if (ref) return { ok: false, refused: ref, reason: 'отказ ChatGPT (правила контента)' };
       dbg('Генерация не началась за 30 с', diag());
       return { ok: false, reason: 'генерация не началась' };
     }
@@ -976,8 +991,10 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       const quietMs = Date.now() - lastMut;
       // Генерация закончилась, а картинки нет — возможно, ChatGPT ответил, что исчерпан лимит
       if (S.waitImage && quietMs > 800 && !newImages(before).length) {
-        const lim = detectLimit();
+        const lim = detectLimit(assistBefore);
         if (lim) return { ok: false, limit: lim, reason: 'лимит ChatGPT' };
+        const ref = detectRefusal(assistBefore);
+        if (ref) return { ok: false, refused: ref, reason: 'отказ ChatGPT (правила контента)' };
       }
 
       if (!S.waitImage) {
@@ -998,6 +1015,20 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   const slug = (s) => norm(s).replace(/[^\p{L}\p{N}]+/gu, '_').replace(/^_+|_+$/g, '').slice(0, 50) || 'image';
   const safeFolder = (s) => (s || '').replace(/[<>:"|?*\x00-\x1f]/g, '').replace(/\\/g, '/')
     .split('/').map((p) => p.trim().replace(/^\.+|\.+$/g, '')).filter(Boolean).join('/');
+  const safeName = (s) => (s || '').replace(/\.[a-z0-9]{2,4}$/i, '').replace(/[<>:"\/\\|?*\x00-\x1f]/g, '_').trim();
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const stamp = () => { const d = new Date(); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}_${pad2(d.getHours())}-${pad2(d.getMinutes())}-${pad2(d.getSeconds())}`; };
+
+  // Состояние текущего запуска: папка, что уже сохранено, что не удалось, итоги по промптам
+  const runCtx = { folder: '', savedKeys: new Set(), pending: [], results: [], mode: 'prompts' };
+  // Результат промпта: в таблицу попадает последний по номеру (повтор заменяет прошлую неудачу)
+  function recordResult(rec) {
+    runCtx.results.push(rec);
+    if (runCtx.mode !== 'edit') { S.resultsMap = S.resultsMap || {}; S.resultsMap[rec.num] = rec; }
+  }
+
+  // Папка: «Загрузки» / базовая / запуск / подпапка (например, edited)
+  const downloadDir = (sub) => [safeFolder(S.folder), S.perRunFolder ? runCtx.folder : '', safeFolder(sub)].filter(Boolean).join('/');
 
   async function blobToDataURL(url) {
     const blob = await (await fetch(url)).blob();
@@ -1007,28 +1038,86 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     });
   }
 
-  async function downloadImgs(imgs, num, prompt, baseName) {
-    const folder = safeFolder(S.folder);
-    let k = 0, saved = 0;
-    for (const img of imgs) {
-      k++;
-      let url = srcOf(img);
+  // Одна и та же картинка встречается в странице несколько раз (миниатюра, полный размер, размытая
+  // заготовка) — раньше из-за этого файл качался дважды. Узнаём картинку по идентификатору в адресе.
+  function imageKey(src) {
+    const m = src.match(/file[-_][A-Za-z0-9]+/);
+    if (m) return m[0];
+    try { const u = new URL(src, location.href); return u.origin + u.pathname + (u.searchParams.get('id') || ''); } catch { return src.slice(0, 200); }
+  }
+  function uniqueImgs(imgs) {
+    const best = new Map();
+    for (const i of imgs) {
+      const k = imageKey(srcOf(i)), cur = best.get(k);
+      if (!cur || (i.naturalWidth || 0) > (cur.naturalWidth || 0)) best.set(k, i); // оставляем самую крупную
+    }
+    return [...best.entries()].map(([key, img]) => ({ key, img }));
+  }
+
+  // Сохранить один файл: до 3 попыток, каждую подтверждает фоновая часть (файл реально на диске)
+  async function saveFile(src, filename) {
+    let url = src;
+    try { if (url.startsWith('blob:')) url = await blobToDataURL(url); } catch (e) { return { ok: false, error: `не прочитать картинку: ${e.message}` }; }
+    let err = '';
+    for (let a = 1; a <= 3; a++) {
       try {
-        if (url.startsWith('blob:')) url = await blobToDataURL(url);
-        const base = baseName
-          ? baseName.replace(/\.[a-z0-9]{2,4}$/i, '').replace(/[<>:"\/\\|?*\x00-\x1f]/g, '_')
-          : `${String(num).padStart(3, '0')}_${slug(prompt)}`;
-        const name = `${base}${imgs.length > 1 ? '_' + k : ''}.png`;
-        const res = await chrome.runtime.sendMessage({
-          type: 'download', url, filename: folder ? `${folder}/${name}` : name,
-        });
-        if (res && res.ok) saved++;
-        else log(`Не скачалось: ${res && res.error}`, 'err');
-      } catch (e) {
-        log(`Ошибка скачивания: ${e.message}`, 'err');
+        const res = await chrome.runtime.sendMessage({ type: 'download', url, filename });
+        if (res && res.ok) return { ok: true, path: res.filename || filename };
+        err = (res && res.error) || 'нет ответа';
+      } catch (e) { err = e.message; }
+      await sleep(1500 * a);
+    }
+    return { ok: false, error: err };
+  }
+
+  // Скачать картинки одного промпта. Возвращает итог для журнала и для таблицы результатов.
+  async function downloadImgs(imgs, job) {
+    const uniq = uniqueImgs(imgs);
+    const fresh = uniq.filter((u) => !runCtx.savedKeys.has(u.key));
+    const skipped = uniq.length - fresh.length;
+    const base = safeName(job.name) || `${pad3(job.num)}_${slug(job.text)}`;
+    const dir = downloadDir(job.sub);
+    const names = [], failed = [];
+    let k = 0;
+    for (const { key, img } of fresh) {
+      k++;
+      const file = `${base}${fresh.length > 1 ? '_' + k : ''}.png`;
+      const res = await saveFile(srcOf(img), dir ? `${dir}/${file}` : file);
+      if (res.ok) { runCtx.savedKeys.add(key); names.push(file); }
+      else {
+        failed.push(file);
+        runCtx.pending.push({ src: srcOf(img), filename: dir ? `${dir}/${file}` : file, label: job.label, key });
+        log(`${job.label}: не скачалось «${file}» — ${res.error}`, 'err');
       }
     }
-    return saved;
+    return { total: uniq.length, saved: names.length, skipped, failed: failed.length, names, dir };
+  }
+
+  // В конце запуска ещё раз пробуем то, что не скачалось
+  async function retryPending() {
+    if (!runCtx.pending.length) return 0;
+    log(`Повторяю скачивание: ${runCtx.pending.length} файл(ов)`, 'warn');
+    const left = [];
+    for (const p of runCtx.pending) {
+      const res = await saveFile(p.src, p.filename);
+      if (res.ok) { runCtx.savedKeys.add(p.key); log(`${p.label}: «${p.filename.split('/').pop()}» скачан со второго раза`, 'ok'); }
+      else left.push(p);
+    }
+    runCtx.pending = left;
+    return left.length;
+  }
+
+  // Таблица результатов запуска — лежит рядом с картинками: что за что и что не вышло
+  async function writeResultsCsv() {
+    const list = runCtx.mode === 'edit' ? runCtx.results : Object.values(S.resultsMap || {}).sort((a, b) => a.num - b.num);
+    if (!S.download || !list.length) return;
+    const esc = (v) => `"${String(v ?? '').replace(/"/g, '""').replace(/\r?\n/g, ' ')}"`;
+    const rows = [['№', 'статус', 'файл', 'промпт', 'секунд', 'причина']].concat(
+      list.map((r) => [r.num, r.status, r.files || '', r.prompt || '', r.sec ?? '', r.reason || '']));
+    const csv = '﻿' + rows.map((r) => r.map(esc).join(';')).join('\r\n');
+    const dir = downloadDir('');
+    const res = await saveFile('data:text/csv;charset=utf-8,' + encodeURIComponent(csv), `${dir ? dir + '/' : ''}_results.csv`);
+    if (res.ok) log(`Таблица результатов: ${dir}/_results.csv`, 'info');
   }
 
   const fmtTime = (sec) => (sec >= 60 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}` : `${sec} с`);
@@ -1052,7 +1141,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   // промежуточное состояние (пауза, стоп, ошибка) не переносится на следующую попытку.
   // job: { num, label, text, attach: () => File[], name, useLib }
   async function runJob(job) {
-    let limitWaits = 0;
+    let limitWaits = 0, refusedText = '', lastReason = '';
     // Файлы из библиотеки: «@имя» в начале промпта, а если их нет — общий из поля «Файл из библиотеки»
     const split = job.useLib ? splitLibRefs(job.text) : { refs: [], text: job.text };
     const libRefs = !job.useLib ? [] : split.refs.length ? [...new Set(split.refs)] : [libNameClean()].filter(Boolean);
@@ -1067,6 +1156,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       await waitIdle();
       const before = new Set(allImgs().map(srcOf));
       const turns = countTurns();
+      const assist = assistCount();
 
       // 1) Чистое поле: убираем текст и вложения, оставшиеся от прошлой попытки
       const inp = findInput();
@@ -1111,7 +1201,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       if (!(await clickSend(el, turns, sendWait))) { log(`${job.label}: не удалось нажать «Отправить»`, 'err'); continue; }
       log(`${job.label} отправлен`, 'info');
 
-      const r = await waitDone(before, turns);
+      const r = await waitDone(before, turns, assist);
       if (!r.ok && r.limit && limitWaits < 12) {
         // Лимит — не ошибка промпта: ждём и повторяем, попытка не тратится
         limitWaits++;
@@ -1119,28 +1209,37 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
         attempt--;
         continue;
       }
-      if (!r.ok) { log(`${job.label}: ${r.reason}`, 'err'); continue; }
+      if (!r.ok && r.refused) {
+        // Отказ по правилам контента. ChatGPT сам советует «попробуйте ещё раз» — ложные срабатывания бывают
+        refusedText = r.refused; lastReason = 'отказ ChatGPT (правила контента)';
+        log(`${job.label}: ChatGPT отказал — «${r.refused.slice(0, 90)}»`, 'warn');
+        continue;
+      }
+      if (!r.ok) { lastReason = r.reason; log(`${job.label}: ${r.reason}`, 'err'); continue; }
+      refusedText = '';
 
       // 6) Результат
-      if (!S.waitImage) { log(`${job.label} готово`, 'ok'); return { ok: true, imgs: 0 }; }
+      if (!S.waitImage) { log(`${job.label} готово`, 'ok'); return { ok: true, imgs: 0, names: [] }; }
       const imgs = newImages(before).filter(imgUsable);
-      if (!imgs.length) { log(`${job.label}: картинка не появилась`, 'err'); continue; }
+      if (!imgs.length) { lastReason = 'картинка не появилась'; log(`${job.label}: картинка не появилась`, 'err'); continue; }
       if (S.download) {
         setStatus('gen', 'Скачивание');
-        const n = await downloadImgs(imgs, job.num, job.text, job.name);
-        log(`${job.label} готово · скачано ${n} из ${imgs.length}${job.name ? ` → ${job.name}.png` : ''}`, 'ok');
-      } else {
-        log(`${job.label} готово · картинок: ${imgs.length}`, 'ok');
+        const d = await downloadImgs(imgs, job);
+        const note = [d.skipped ? `дубль пропущен: ${d.skipped}` : '', d.failed ? `НЕ СКАЧАНО: ${d.failed}` : ''].filter(Boolean).join(' · ');
+        log(`${job.label} готово · скачано ${d.saved} из ${d.total}${d.names.length ? ' → ' + d.names.join(', ') : ''}${note ? ' · ' + note : ''}`, d.failed ? 'warn' : 'ok');
+        return { ok: true, imgs: d.saved, names: d.names, dlFailed: d.failed };
       }
-      return { ok: true, imgs: imgs.length };
+      log(`${job.label} готово · картинок: ${uniqueImgs(imgs).length}`, 'ok');
+      return { ok: true, imgs: uniqueImgs(imgs).length, names: [] };
     }
-    return { ok: false, imgs: 0 };
+    return { ok: false, imgs: 0, refused: refusedText, reason: lastReason };
   }
 
-  // mode: 'prompts' — очередь промптов; 'edit' — доработка готовых картинок из папки
+  // mode: 'prompts' — очередь промптов; 'edit' — доработка готовых картинок из папки;
+  //       'retry' — только те промпты, что не вышли в прошлый раз (отказы, ошибки)
   async function start(mode = 'prompts') {
     readForm();
-    const isEdit = mode === 'edit';
+    const isEdit = mode === 'edit', isRetry = mode === 'retry';
     const editText = (S.editPrompt || '').trim();
     let jobs = [];
 
@@ -1149,7 +1248,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       if (!files.edit.length) { flash('Сначала выберите папку с картинками'); return; }
       jobs = files.edit.map((f, i) => ({
         num: i + 1, label: `✎${i + 1}`, text: editText, display: f.name,
-        attach: () => [f], name: stemOf(f.name) + (S.editSuffix || ''),
+        attach: () => [f], name: stemOf(f.name) + (S.editSuffix || ''), sub: '',
       }));
     } else {
       const prompts = parsePrompts(S.text, S.sep);
@@ -1158,10 +1257,15 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       jobs = prompts.map((p, i) => ({
         num: i + 1, label: `#${i + 1}`, display: p,
         text: (S.prefix.trim() ? S.prefix.trim() + ' ' : '') + p,
-        useLib: true,
+        useLib: true, sub: '',
         attach: null, // задаётся ниже — зависит от того, первый ли это промпт запуска
         name: (named && S.names[i]) ? stemOf(S.names[i]) : `${pad3(i + 1)}_${slug(p)}`,
       }));
+    }
+    if (isRetry) {
+      const want = new Set(S.failed || []);
+      jobs = jobs.filter((j) => want.has(j.num));
+      if (!jobs.length) { S.failed = []; save(); updateButtons(); flash('Пропущенных промптов нет'); return; }
     }
     if (!findInput()) { flash('Поле ввода ChatGPT не найдено — нажмите «Проверить поле»'); dbg('Старт: поле не найдено', diag()); return; }
     dbg('Старт', diag());
@@ -1169,12 +1273,26 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     run.active = true; run.paused = false; run.stop = false;
     startTicker();
     updateButtons();
-    let i = isEdit ? 0 : Math.min(Math.max(0, (parseInt(S.startFrom, 10) || 1) - 1), jobs.length - 1);
-    const startIdx = i;
-    if (!isEdit) jobs.forEach((j, k) => { j.attach = () => attachmentsFor(k, k === startIdx); });
-    const followUp = !isEdit && S.followUp && editText;
 
-    let okCount = 0, imgCount = 0;
+    // С какого места идём
+    let i = (isEdit || isRetry) ? 0 : Math.min(Math.max(0, (parseInt(S.startFrom, 10) || 1) - 1), jobs.length - 1);
+    const startIdx = i;
+    const freshStart = !isEdit && !isRetry && (parseInt(S.startFrom, 10) || 1) <= 1;
+    if (!isEdit) jobs.forEach((j, k) => { j.attach = () => attachmentsFor(j.num - 1, k === startIdx); });
+    const followUp = !isEdit && !isRetry && S.followUp && editText;
+
+    // Папка запуска: «продолжить» кладёт файлы в ту же папку, новый запуск с №1 — в новую
+    runCtx.savedKeys = new Set(); runCtx.pending = []; runCtx.results = []; runCtx.mode = mode;
+    if (isEdit) runCtx.folder = `edit_${stamp()}`;
+    else {
+      if (freshStart || !S.runFolder) S.runFolder = `${stamp()}${S.csvName ? '_' + slug(S.csvName) : ''}`;
+      runCtx.folder = S.runFolder;
+    }
+    if (freshStart) S.resultsMap = {};
+    const failedSet = new Set(freshStart ? [] : (S.failed || []));
+    if (!isEdit) { S.failed = [...failedSet]; save(); }
+
+    let okCount = 0, imgCount = 0, refusedCount = 0, errCount = 0, streak = 0;
     const t0 = Date.now();
     if (isEdit) {
       log(`Доработка: ${jobs.length} картинок, суффикс «${S.editSuffix || ''}»`, 'info');
@@ -1187,8 +1305,9 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       if (own) log(`Свои файлы «@имя» указаны в ${own} ${plural(own, 'промпте', 'промптах', 'промптах')} — для них общий файл не добавляется`, 'info');
       if (!libNameClean() && !own) log('Файлы из библиотеки не используются', 'info');
       if (followUp) log('После каждой картинки будет отправляться доработка', 'info');
-      log(`Старт: ${jobs.length} промптов, начиная с №${i + 1}`, 'info');
+      log(isRetry ? `Повторяю пропущенные: ${jobs.map((j) => j.label).join(', ')}` : `Старт: ${jobs.length} промптов, начиная с №${i + 1}`, 'info');
     }
+    if (S.download) log(`Папка: Загрузки/${downloadDir('') || '(корень)'}`, 'info');
 
     try {
       for (; i < jobs.length; i++) {
@@ -1198,32 +1317,54 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
         setProgress(i, jobs.length);
         setCurrent(i + 1, job.display);
 
+        const jt0 = Date.now();
         const res = await runJob(job);
+        const sec = Math.round((Date.now() - jt0) / 1000);
+
         if (!res.ok) {
-          log(`${job.label} не получился. «Продолжить» повторит его`, 'warn');
-          notify('Очередь на паузе', `${job.label} не получился — нужна проверка`);
-          run.paused = true; updateButtons();
-          setStatus('error', 'Ошибка — очередь на паузе');
-          await waitPause();
-          i--; // повторить тот же
-          continue;
-        }
-        imgCount += res.imgs;
+          streak++;
+          // Одна неудача (отказ, сбой) не должна останавливать очередь на 50 промптов:
+          // откладываем и идём дальше. Три подряд — похоже на системную проблему, тогда пауза.
+          if (S.skipFailed && streak < 3) {
+            if (res.refused) refusedCount++; else errCount++;
+            recordResult({ num: job.num, status: res.refused ? 'отказ' : 'ошибка', prompt: job.display, sec, reason: res.refused || res.reason || '' });
+            failedSet.add(job.num);
+            log(`${job.label}: ${res.refused ? 'отказ ChatGPT' : 'не получился'} — пропускаю, вернусь к нему кнопкой «Повторить пропущенные»`, 'warn');
+          } else {
+            log(`${job.label} не получился${streak >= 3 ? ' (третий подряд)' : ''}. «Продолжить» повторит его`, 'warn');
+            notify('Очередь на паузе', `${job.label} не получился — нужна проверка`);
+            run.paused = true; updateButtons();
+            setStatus('error', 'Ошибка — очередь на паузе');
+            await waitPause();
+            streak = 0;
+            i--; // повторить тот же
+            continue;
+          }
+        } else {
+          streak = 0;
+          imgCount += res.imgs;
+          failedSet.delete(job.num);
+          let status = res.dlFailed ? 'не скачано' : 'ок';
+          okCount++;
 
-        // Доработка только что созданной картинки в том же чате
-        if (followUp) {
-          await sleepChecked(800, (s) => setStatus('wait', `Доработка через ${s} с`));
-          setCurrent(i + 1, `доработка: ${job.display}`);
-          const fx = await runJob({
-            num: job.num, label: `${job.label} ✎`, text: editText, attach: null,
-            name: job.name + (S.editSuffix || ''),
-          });
-          if (fx.ok) imgCount += fx.imgs;
-          else log(`${job.label}: доработка не получилась — идём дальше`, 'warn');
+          // Доработка только что созданной картинки в том же чате — в подпапку edited
+          if (followUp) {
+            await sleepChecked(800, (s) => setStatus('wait', `Доработка через ${s} с`));
+            setCurrent(i + 1, `доработка: ${job.display}`);
+            const fx = await runJob({
+              num: job.num, label: `${job.label} ✎`, text: editText, attach: null,
+              name: job.name + (S.editSuffix || ''), sub: 'edited',
+            });
+            if (fx.ok) { imgCount += fx.imgs; if (fx.dlFailed) status = 'не скачано'; }
+            else { log(`${job.label}: доработка не получилась — идём дальше`, 'warn'); status += ', доработка не вышла'; }
+            if (fx.ok && fx.names.length) res.names = res.names.concat(fx.names.map((n) => `edited/${n}`));
+          }
+          recordResult({ num: job.num, status, files: (res.names || []).join(', '), prompt: job.display, sec });
         }
 
-        okCount++;
-        if (!isEdit) { S.startFrom = i + 2; save(); syncStartField(); }
+        S.failed = [...failedSet];
+        if (!isEdit && !isRetry) S.startFrom = i + 2;
+        save(); syncStartField();
         setProgress(i + 1, jobs.length);
 
         if (i < jobs.length - 1) {
@@ -1232,22 +1373,35 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
           if (d > 0) await sleepChecked(d * 1000, (s) => setStatus('wait', `Следующий через ${s} с`));
         }
       }
+
+      // Конец очереди: добираем то, что не скачалось, и подводим итог
+      setStatus('gen', 'Проверяю скачивание');
+      const dlLeft = await retryPending();
       const took = fmtTime(Math.round((Date.now() - t0) / 1000));
-      log(`Готово: ${okCount} ${isEdit ? 'картинок доработано' : 'промптов'}${S.waitImage ? `, скачано ${imgCount}` : ''} за ${took}`, 'ok');
-      setStatus('done', isEdit ? 'Доработка завершена' : 'Все промпты выполнены');
-      notify('Готово', `${okCount} ${isEdit ? 'картинок доработано' : 'промптов выполнено'} за ${took}`);
+      const parts = [`✓ ${okCount}`];
+      if (refusedCount) parts.push(`отказов ${refusedCount}`);
+      if (errCount) parts.push(`ошибок ${errCount}`);
+      if (dlLeft) parts.push(`НЕ СКАЧАНО ${dlLeft}`);
+      log(`Готово за ${took}: ${parts.join(' · ')}${S.waitImage ? ` · картинок ${imgCount}` : ''}`, dlLeft || refusedCount || errCount ? 'warn' : 'ok');
+      if (failedSet.size) log(`Пропущено: ${[...failedSet].sort((a, b) => a - b).map((n) => '#' + n).join(', ')} — нажмите «Повторить пропущенные»`, 'warn');
+      if (dlLeft) log('Картинки, которые не скачались, остались в чате ChatGPT — скачайте их вручную', 'warn');
+      setStatus('done', failedSet.size ? `Готово, пропущено: ${failedSet.size}` : isEdit ? 'Доработка завершена' : 'Все промпты выполнены');
+      notify(failedSet.size ? 'Готово, есть пропущенные' : 'Готово', `${parts.join(' · ')} за ${took}`);
       setCurrent(null);
-      if (!isEdit) { S.startFrom = 1; save(); syncStartField(); }
+      if (!isEdit && !isRetry) S.startFrom = 1;
     } catch (e) {
       if (e.message === 'STOP') {
-        log(isEdit ? 'Остановлено' : `Остановлено. Продолжить можно с №${S.startFrom}`, 'warn');
+        log(isEdit || isRetry ? 'Остановлено' : `Остановлено. Продолжить можно с №${S.startFrom}`, 'warn');
         setStatus('idle', 'Остановлено');
       } else {
         log(`Ошибка: ${e.message}`, 'err'); setStatus('error', 'Ошибка');
         notify('Очередь остановлена', e.message);
       }
     }
-    // Убираем за собой: заготовку следующего промпта, «@файл» и превью вложений в поле ввода
+    S.failed = [...failedSet];
+    save(); syncStartField();
+    try { await writeResultsCsv(); } catch (e) { dbg(`Не записалась таблица результатов: ${e.message}`); }
+    // Убираем за собой: недописанный промпт, «@файл» и превью вложений в поле ввода
     await cleanupComposer();
     run.active = false; run.paused = false;
     stopTicker();
@@ -1580,12 +1734,20 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
               <span class="sw"><input type="checkbox" data-k="notify"><span></span></span>
             </label>
             <label class="sw-row">
+              <div><div class="t">Пропускать неудачные</div><div class="d">Отказ ChatGPT или сбой не останавливает очередь: промпт откладывается, потом его можно повторить кнопкой</div></div>
+              <span class="sw"><input type="checkbox" data-k="skipFailed"><span></span></span>
+            </label>
+            <label class="sw-row">
               <div><div class="t">Скачивать картинки</div><div class="d">В «Загрузки» → папка ниже</div></div>
               <span class="sw"><input type="checkbox" data-k="download"><span></span></span>
             </label>
             <div class="field" data-folder-field>
               <input class="inp" data-k="folder" placeholder="ChatGPT_Images">
             </div>
+            <label class="sw-row" data-folder-field>
+              <div><div class="t">Отдельная папка на запуск</div><div class="d">Папка с датой и именем CSV; доработанные — в подпапке edited; рядом таблица _results.csv</div></div>
+              <span class="sw"><input type="checkbox" data-k="perRunFolder"><span></span></span>
+            </label>
           </div>
         </details>
 
@@ -1602,6 +1764,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
             <button class="btn primary" data-start>${I.play}<span>Запустить</span></button>
             <button class="btn secondary hidden" data-pause>${I.pause}<span>Пауза</span></button>
             <button class="btn danger hidden" data-stop title="Остановить">${I.stop}</button>
+            <button class="btn secondary hidden" data-retry title="Запустить заново только те промпты, что не вышли">${I.play}<span>Повторить пропущенные</span></button>
           </div>
           <div class="flash" data-flash></div>
         </div>
@@ -1624,11 +1787,11 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   Object.assign(ui, {
     root: q('.root'), panel: q('.panel'), hdr: q('.hdr'), fab: q('.fab'), badge: q('.fab .badge'),
     pill: q('[data-pill]'), status: q('[data-status]'), prognum: q('[data-prognum]'), bar: q('.bar i'),
-    current: q('[data-current]'), start: q('[data-start]'), pause: q('[data-pause]'), stop: q('[data-stop]'),
+    current: q('[data-current]'), start: q('[data-start]'), pause: q('[data-pause]'), stop: q('[data-stop]'), retry: q('[data-retry]'),
     flash: q('[data-flash]'), log: q('[data-log]'), count: q('[data-count]'), seg: q('[data-seg]'),
     file: q('[data-file]'), upload: q('[data-upload]'), clear: q('[data-clear]'), textarea: q('textarea'),
     settings: q('[data-settings]'), summary: q('[data-summary]'), logbox: q('[data-logbox]'),
-    folderField: q('[data-folder-field]'),
+    folderFields: [...shadow.querySelectorAll('[data-folder-field]')],
     fields: [...shadow.querySelectorAll('[data-k]')],
     commonInfo: q('[data-commoninfo]'), refInfo: q('[data-refinfo]'), cmode: q('[data-cmode]'),
     pickCommon: q('[data-pickcommon]'), pickRefs: q('[data-pickrefs]'), clearFiles: q('[data-clearfiles]'),
@@ -1736,7 +1899,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     const n = parsePrompts(S.text, S.sep).length;
     ui.count.innerHTML = n ? `<b>${n}</b> ${plural(n, 'промпт', 'промпта', 'промптов')}` : 'пусто';
     [...ui.seg.children].forEach((b) => b.classList.toggle('on', b.dataset.v === S.sep));
-    ui.folderField.classList.toggle('hidden', !S.download);
+    ui.folderFields.forEach((f) => f.classList.toggle('hidden', !S.download));
     const bits = [`${S.delayMin}–${S.delayMax} с`];
     if (S.download) bits.push('скачивание');
     if (S.prefix.trim()) bits.push('префикс');
@@ -1778,6 +1941,9 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     ui.start.classList.toggle('hidden', run.active);
     ui.pause.classList.toggle('hidden', !run.active);
     ui.stop.classList.toggle('hidden', !run.active);
+    const nFailed = (S.failed || []).length;
+    ui.retry.classList.toggle('hidden', run.active || !nFailed);
+    ui.retry.querySelector('span').textContent = `Повторить пропущенные (${nFailed})`;
     ui.pause.innerHTML = run.paused ? `${I.play}<span>Продолжить</span>` : `${I.pause}<span>Пауза</span>`;
     ui.fields.forEach((f) => { f.disabled = run.active; });
     [...ui.seg.children, ui.upload, ui.clear, ui.pickCommon, ui.pickRefs, ui.pickWord, ui.clearFiles, ...ui.cmode.children, ui.pickEdit, ui.testLib]
@@ -1879,6 +2045,9 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     S.refs = refs.some(Boolean) ? refs : [];
     S.wordRows = rows.some(Boolean) ? rows : [];
     S.startFrom = 1;
+    // Новый файл — новый набор: имя для папки запуска, прошлые пропущенные больше не актуальны
+    S.csvName = file.name.replace(/\.[a-z0-9]{2,5}$/i, '');
+    S.runFolder = ''; S.failed = []; S.resultsMap = {};
     fillForm(); save();
     log(`Загружен ${file.name}: ${prompts.length} ${plural(prompts.length, 'промпт', 'промпта', 'промптов')}` +
       (S.names.length ? ', имена файлов из CSV' : ''), 'info');
@@ -1985,7 +2154,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   });
   ui.clear.addEventListener('click', () => {
     if (!S.text.trim() || confirm('Очистить список промптов?')) {
-      S.text = ''; S.names = []; S.refs = []; S.startFrom = 1; fillForm(); save();
+      S.text = ''; S.names = []; S.refs = []; S.startFrom = 1; S.csvName = ''; S.runFolder = ''; S.failed = []; S.resultsMap = {}; fillForm(); save();
     }
   });
   ui.textarea.addEventListener('dragover', (e) => {
@@ -2016,6 +2185,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   q('[data-min]').addEventListener('click', () => setOpen(false));
   ui.fab.addEventListener('click', () => setOpen(true));
   ui.start.addEventListener('click', () => { if (!run.active) start(); });
+  ui.retry.addEventListener('click', () => { if (!run.active) start('retry'); });
   ui.pause.addEventListener('click', () => {
     run.paused = !run.paused;
     if (run.paused) { log('Пауза после текущего промпта', 'warn'); setStatus('paused', 'Пауза после текущего промпта'); }
@@ -2044,6 +2214,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     document.documentElement.appendChild(host);
     syncTheme();
     fillForm();
+    updateButtons();
     ready = true;
     if (openRequested) setOpen(true);
     applyPos();
