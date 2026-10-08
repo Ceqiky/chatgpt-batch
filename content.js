@@ -754,7 +754,12 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     // Такие строки подбираем по порядку.
     const cnt = {};
     out.forEach((r) => { cnt[labelKey(r.label)] = (cnt[labelKey(r.label)] || 0) + 1; });
-    out.forEach((r) => { r.vague = /^\d+$/.test(r.label.trim()) || cnt[labelKey(r.label)] > 1; });
+    out.forEach((r) => {
+      r.vague = /^\d+$/.test(r.label.trim()) || cnt[labelKey(r.label)] > 1;
+      const sec = labelKey(r.section), n = (r.label.match(/\d+/) || [])[0];
+      r.kind = /слайд|slide/.test(sec) ? 'sld' : /подробн|podrobn/.test(sec) ? 'txt' : '';
+      r.num = n ? +n : 0;
+    });
     return out;
   }
 
@@ -773,6 +778,21 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       if (r) return { row: r, how: 'колонка «строка_в_Word»' };
     }
     const t = labelKey(prompts[i] || '');
+    // Строки с названием «1», «2»… из разделов «слайды» / «подробнее»: раздел и номер берём из имени файла
+    // (che_sld1…, che_txt_i2…), из колонки референса или из начала промпта («Слайд 1», «Подробнее 2»)
+    if (rows.some((r) => r.vague && r.kind)) {
+      const hay = labelKey([S.names && S.names[i], S.refs && S.refs[i], t.slice(0, 300)].filter(Boolean).join(' | '));
+      const found = [];
+      for (const [kind, re] of [['sld', /(?:слайд\w*|slide|sld)\D{0,4}(\d+)/], ['txt', /(?:подробнее|podrobnee|txt)\D{0,4}(\d+)/]]) {
+        const m = hay.match(re);
+        if (m) found.push({ kind, num: +m[1], at: m.index });
+      }
+      found.sort((a, b) => a.at - b.at);
+      for (const f of found) {
+        const r = rows.find((x) => x.vague && x.kind === f.kind && x.num === f.num);
+        if (r) return { row: r, how: 'раздел и номер' };
+      }
+    }
     let loose = null;
     for (const r of rows) {
       const L = labelKey(r.label);
