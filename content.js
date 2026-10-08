@@ -2293,7 +2293,12 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     else log('Продолжаем', 'info');
     updateButtons();
   });
-  ui.stop.addEventListener('click', () => { run.stop = true; run.paused = false; setStatus('paused', 'Останавливаем…'); });
+  // «Стоп» останавливает и саму генерацию в ChatGPT (раньше он дорисовывал картинку, а очередь уже стояла)
+  ui.stop.addEventListener('click', () => {
+    run.stop = true; run.paused = false; setStatus('paused', 'Останавливаем…');
+    const b = $(SEL.stop);
+    if (b) { try { b.click(); log('Генерация в ChatGPT остановлена', 'info'); } catch { /* кнопка исчезла */ } }
+  });
 
   let ready = false, openRequested = false;
   const onMsg = (msg) => {
