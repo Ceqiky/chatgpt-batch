@@ -105,7 +105,7 @@ DO NOT: add any new element, text or decoration; move, resize, restyle, recolour
 
 RESULT: the same scene, isolated on a clean pure black background — only the objects, their lines and arrows, shadows and native glow — ready for compositing with the Screen blend mode. Clean edges, no dark halo or grey fringe around objects.`,
     editSuffix: '_black', followUp: false, editOpen: false,
-    libName: '', notify: true, skipFailed: true, perRunFolder: true,
+    libName: '', notify: true, skipFailed: true, perRunFolder: true, onlyFinal: true,
     runFolder: '', csvName: '', failed: [], resultsMap: {},
     open: true, settingsOpen: false, logOpen: true, pos: null,
   };
@@ -268,7 +268,18 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     return newImages(before).some((i) => !imgUsable(i) || isBlurred(i));
   }
 
-  function checkStop() { if (run.stop) throw new Error('STOP'); }
+  // Очередь привязана к чату, в котором её запустили: перешли в другой — останавливаемся,
+  // а не начинаем слать промпты туда. Пустой чат (/) после первой отправки становится /c/<id> — это тот же чат.
+  const chatPath = () => location.pathname.replace(/\/+$/, '') || '/';
+  function checkChat() {
+    if (!run.chatPath) return;
+    const cur = chatPath();
+    if (cur === run.chatPath) return;
+    if (!run.chatPath.startsWith('/c/') && cur.startsWith('/c/')) { run.chatPath = cur; return; }
+    run.stop = true; run.paused = false;
+    log('Вы перешли в другой чат — очередь остановлена. Вернитесь в нужный чат и нажмите «Продолжить»', 'warn');
+  }
+  function checkStop() { checkChat(); if (run.stop) throw new Error('STOP'); }
   async function waitPause() { while (run.paused) { checkStop(); await sleep(300); } }
   async function sleepChecked(ms, onTick) {
     const end = Date.now() + ms;
@@ -1071,8 +1082,20 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   }
 
   // Скачать картинки одного промпта. Возвращает итог для журнала и для таблицы результатов.
+  // Из найденных картинок оставляем итог генерации: без размытых заготовок и уменьшенных черновиков.
+  // Если ChatGPT показал несколько вариантов одинакового размера — берём последний.
+  function finalImages(imgs) {
+    const list = uniqueImgs(imgs);
+    dbg('Картинки ответа', list.map(({ key, img }) => `${key.slice(0, 18)} ${img.naturalWidth}×${img.naturalHeight}${isBlurred(img) ? ' blur' : ''}`));
+    if (!S.onlyFinal || list.length < 2) return list;
+    let ok = list.filter(({ img }) => !isBlurred(img));
+    if (!ok.length) ok = list;
+    const maxW = Math.max(...ok.map(({ img }) => img.naturalWidth || 0));
+    ok = ok.filter(({ img }) => (img.naturalWidth || 0) >= maxW * 0.8);
+    return [ok[ok.length - 1]];
+  }
   async function downloadImgs(imgs, job) {
-    const uniq = uniqueImgs(imgs);
+    const uniq = S.onlyFinal ? finalImages(imgs) : uniqueImgs(imgs);
     const fresh = uniq.filter((u) => !runCtx.savedKeys.has(u.key));
     const skipped = uniq.length - fresh.length;
     const base = safeName(job.name) || `${pad3(job.num)}_${slug(job.text)}`;
@@ -1083,7 +1106,10 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       k++;
       const file = `${base}${fresh.length > 1 ? '_' + k : ''}.png`;
       const res = await saveFile(srcOf(img), dir ? `${dir}/${file}` : file);
-      if (res.ok) { runCtx.savedKeys.add(key); names.push(file); }
+      if (res.ok) {
+        runCtx.savedKeys.add(key); names.push(file);
+        if (runCtx.mode !== 'edit') S.savedKeys = [...runCtx.savedKeys].slice(-1000);
+      }
       else {
         failed.push(file);
         runCtx.pending.push({ src: srcOf(img), filename: dir ? `${dir}/${file}` : file, label: job.label, key });
@@ -1105,19 +1131,6 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     }
     runCtx.pending = left;
     return left.length;
-  }
-
-  // Таблица результатов запуска — лежит рядом с картинками: что за что и что не вышло
-  async function writeResultsCsv() {
-    const list = runCtx.mode === 'edit' ? runCtx.results : Object.values(S.resultsMap || {}).sort((a, b) => a.num - b.num);
-    if (!S.download || !list.length) return;
-    const esc = (v) => `"${String(v ?? '').replace(/"/g, '""').replace(/\r?\n/g, ' ')}"`;
-    const rows = [['№', 'статус', 'файл', 'промпт', 'секунд', 'причина']].concat(
-      list.map((r) => [r.num, r.status, r.files || '', r.prompt || '', r.sec ?? '', r.reason || '']));
-    const csv = '﻿' + rows.map((r) => r.map(esc).join(';')).join('\r\n');
-    const dir = downloadDir('');
-    const res = await saveFile('data:text/csv;charset=utf-8,' + encodeURIComponent(csv), `${dir ? dir + '/' : ''}_results.csv`);
-    if (res.ok) log(`Таблица результатов: ${dir}/_results.csv`, 'info');
   }
 
   const fmtTime = (sec) => (sec >= 60 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}` : `${sec} с`);
@@ -1277,7 +1290,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     if (!findInput()) { flash('Поле ввода ChatGPT не найдено — нажмите «Проверить поле»'); dbg('Старт: поле не найдено', diag()); return; }
     dbg('Старт', diag());
 
-    run.active = true; run.paused = false; run.stop = false;
+    run.active = true; run.paused = false; run.stop = false; run.chatPath = chatPath();
     startTicker();
     updateButtons();
 
@@ -1295,7 +1308,9 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       if (freshStart || !S.runFolder) S.runFolder = `${stamp()}${S.csvName ? '_' + slug(S.csvName) : ''}`;
       runCtx.folder = S.runFolder;
     }
-    if (freshStart) S.resultsMap = {};
+    if (freshStart) { S.resultsMap = {}; S.savedKeys = []; }
+    // Пауза/стоп/«Продолжить» в той же папке: что уже скачано, второй раз не качаем
+    if (!isEdit && !freshStart) runCtx.savedKeys = new Set(S.savedKeys || []);
     const failedSet = new Set(freshStart ? [] : (S.failed || []));
     if (!isEdit) { S.failed = [...failedSet]; save(); }
 
@@ -1407,7 +1422,6 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     }
     S.failed = [...failedSet];
     save(); syncStartField();
-    try { await writeResultsCsv(); } catch (e) { dbg(`Не записалась таблица результатов: ${e.message}`); }
     // Убираем за собой: недописанный промпт, «@файл» и превью вложений в поле ввода
     await cleanupComposer();
     run.active = false; run.paused = false;
@@ -1752,8 +1766,12 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
               <input class="inp" data-k="folder" placeholder="ChatGPT_Images">
             </div>
             <label class="sw-row" data-folder-field>
-              <div><div class="t">Отдельная папка на запуск</div><div class="d">Папка с датой и именем CSV; доработанные — в подпапке edited; рядом таблица _results.csv</div></div>
+              <div><div class="t">Отдельная папка на запуск</div><div class="d">Папка с датой и именем CSV; доработанные — в подпапке edited</div></div>
               <span class="sw"><input type="checkbox" data-k="perRunFolder"><span></span></span>
+            </label>
+            <label class="sw-row" data-folder-field>
+              <div><div class="t">Только итог генерации</div><div class="d">Не скачивать черновики и размытые заготовки — одна итоговая картинка на промпт</div></div>
+              <span class="sw"><input type="checkbox" data-k="onlyFinal"><span></span></span>
             </label>
           </div>
         </details>
