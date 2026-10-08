@@ -1107,8 +1107,51 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     if (runCtx.mode !== 'edit') { S.resultsMap = S.resultsMap || {}; S.resultsMap[rec.num] = rec; }
   }
 
-  // Папка: «Загрузки» / базовая / запуск / подпапка (например, edited)
-  const downloadDir = (sub) => [safeFolder(S.folder), S.perRunFolder ? runCtx.folder : '', safeFolder(sub)].filter(Boolean).join('/');
+  // ─── Своя папка для скачивания (File System Access API) ───
+  // Расширения Chrome умеют качать только внутрь «Загрузок». Выбранную папку запоминаем (дескриптор в IndexedDB)
+  // и пишем файлы прямо в неё; не выбрана или нет доступа — как раньше, в «Загрузки/<базовая папка>».
+  let dirHandle = null, useDir = false;
+  const idb = () => new Promise((res, rej) => {
+    const r = indexedDB.open('cgptBatchDir', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+  async function idbOp(mode, fn) {
+    const db = await idb();
+    return new Promise((res, rej) => {
+      const tx = db.transaction('kv', mode), req = fn(tx.objectStore('kv'));
+      tx.oncomplete = () => { db.close(); res(req.result); }; tx.onerror = () => { db.close(); rej(tx.error); };
+    });
+  }
+  const loadDirHandle = async () => { try { dirHandle = (await idbOp('readonly', (st) => st.get('dir'))) || null; } catch { dirHandle = null; } };
+  async function dirAccess(ask) {
+    if (!dirHandle) return false;
+    try {
+      let p = await dirHandle.queryPermission({ mode: 'readwrite' });
+      if (p !== 'granted' && ask) p = await dirHandle.requestPermission({ mode: 'readwrite' });
+      return p === 'granted';
+    } catch { return false; }
+  }
+  const b64ToBytes = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  async function bytesOf(src) {
+    if (src.startsWith('data:') || src.startsWith('blob:')) return new Uint8Array(await (await fetch(src)).arrayBuffer());
+    // обычные ссылки качает фоновая часть: у неё нет ограничений CORS и есть куки
+    const r = await chrome.runtime.sendMessage({ type: 'fetchBytes', url: src });
+    if (!r || !r.ok) throw new Error((r && r.error) || 'нет ответа');
+    return b64ToBytes(r.b64);
+  }
+  async function writeToDir(src, path) {
+    const bytes = await bytesOf(src);
+    const parts = path.split('/').filter(Boolean);
+    let d = dirHandle;
+    for (const part of parts.slice(0, -1)) d = await d.getDirectoryHandle(part, { create: true });
+    const fh = await d.getFileHandle(parts[parts.length - 1], { create: true });
+    const w = await fh.createWritable();
+    await w.write(bytes); await w.close();
+  }
+
+  // Папка: «Загрузки/базовая» (или выбранная папка) / запуск / подпапка (например, edited)
+  const downloadDir = (sub) => [useDir ? '' : safeFolder(S.folder), S.perRunFolder ? runCtx.folder : '', safeFolder(sub)].filter(Boolean).join('/');
 
   async function blobToDataURL(url) {
     const blob = await (await fetch(url)).blob();
@@ -1140,6 +1183,11 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     try { if (url.startsWith('blob:')) url = await blobToDataURL(url); } catch (e) { return { ok: false, error: `не прочитать картинку: ${e.message}` }; }
     let err = '';
     for (let a = 1; a <= 3; a++) {
+      if (useDir) {
+        try { await writeToDir(url, filename); return { ok: true, path: filename }; } catch (e) { err = e.message || String(e); }
+        await sleep(1500 * a);
+        continue;
+      }
       try {
         const res = await chrome.runtime.sendMessage({ type: 'download', url, filename });
         if (res && res.ok) return { ok: true, path: res.filename || filename };
@@ -1327,6 +1375,12 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   // mode: 'prompts' — очередь промптов; 'edit' — доработка готовых картинок из папки;
   //       'retry' — только те промпты, что не вышли в прошлый раз (отказы, ошибки)
   async function start(mode = 'prompts') {
+    // Доступ к выбранной папке спрашиваем сразу: запрос работает только сразу после нажатия кнопки
+    useDir = false;
+    if (S.download && dirHandle) {
+      useDir = await dirAccess(true);
+      if (!useDir) log('Нет доступа к выбранной папке — скачиваю в «Загрузки»', 'warn');
+    }
     readForm();
     const isEdit = mode === 'edit', isRetry = mode === 'retry';
     const editText = (S.editPrompt || '').trim();
@@ -1398,7 +1452,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       if (followUp) log('После каждой картинки будет отправляться доработка', 'info');
       log(isRetry ? `Повторяю пропущенные: ${jobs.map((j) => j.label).join(', ')}` : `Старт: ${jobs.length} промптов, начиная с №${i + 1}`, 'info');
     }
-    if (S.download) log(`Папка: Загрузки/${downloadDir('') || '(корень)'}`, 'info');
+    if (S.download) log(`Папка: ${useDir ? dirHandle.name : 'Загрузки'}/${downloadDir('') || '(корень)'}`, 'info');
 
     try {
       for (; i < jobs.length; i++) {
@@ -1828,11 +1882,15 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
               <span class="sw"><input type="checkbox" data-k="skipFailed"><span></span></span>
             </label>
             <label class="sw-row">
-              <div><div class="t">Скачивать картинки</div><div class="d">В «Загрузки» → папка ниже</div></div>
+              <div><div class="t">Скачивать картинки</div><div class="d">В выбранную папку, а если не выбрана — в «Загрузки/ChatGPT_Images»</div></div>
               <span class="sw"><input type="checkbox" data-k="download"><span></span></span>
             </label>
             <div class="field" data-folder-field>
-              <input class="inp" data-k="folder" placeholder="ChatGPT_Images">
+              <div class="frow">
+                <button class="ghost" data-pickdir title="Выбрать папку на компьютере">Выбрать папку</button>
+                <span class="d" data-dirinfo style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+                <button class="clear-log hidden" data-cleardir>Сбросить</button>
+              </div>
             </div>
             <label class="sw-row" data-folder-field>
               <div><div class="t">Отдельная папка на запуск</div><div class="d">Папка с датой и именем CSV; доработанные — в подпапке edited</div></div>
@@ -1890,7 +1948,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     commonInfo: q('[data-commoninfo]'), refInfo: q('[data-refinfo]'), cmode: q('[data-cmode]'),
     pickCommon: q('[data-pickcommon]'), pickRefs: q('[data-pickrefs]'), clearFiles: q('[data-clearfiles]'),
     commonFile: q('[data-commonfile]'), refDir: q('[data-refdir]'),
-    pickWord: q('[data-pickword]'), wordDoc: q('[data-worddoc]'), testLib: q('[data-testlib]'),
+    pickWord: q('[data-pickword]'), pickDir: q('[data-pickdir]'), clearDir: q('[data-cleardir]'), dirInfo: q('[data-dirinfo]'), wordDoc: q('[data-worddoc]'), testLib: q('[data-testlib]'),
     editBox: q('[data-editbox]'), editHint: q('[data-edithint]'), editInfo: q('[data-editinfo]'),
     pickEdit: q('[data-pickedit]'), runEdit: q('[data-runedit]'), editDir: q('[data-editdir]'),
   });
@@ -2040,7 +2098,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     ui.retry.querySelector('span').textContent = `Повторить пропущенные (${nFailed})`;
     ui.pause.innerHTML = run.paused ? `${I.play}<span>Продолжить</span>` : `${I.pause}<span>Пауза</span>`;
     ui.fields.forEach((f) => { f.disabled = run.active; });
-    [...ui.seg.children, ui.upload, ui.clear, ui.pickCommon, ui.pickRefs, ui.pickWord, ui.clearFiles, ...ui.cmode.children, ui.pickEdit, ui.testLib]
+    [...ui.seg.children, ui.upload, ui.clear, ui.pickCommon, ui.pickRefs, ui.pickWord, ui.pickDir, ui.clearDir, ui.clearFiles, ...ui.cmode.children, ui.pickEdit, ui.testLib]
       .forEach((b) => { b.disabled = run.active; });
     refreshEdit();
     ui.fab.classList.toggle('running', run.active);
@@ -2178,6 +2236,28 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   });
 
   // Референсы из Word-ТЗ: картинки из строк таблицы
+  function refreshDir() {
+    ui.dirInfo.textContent = dirHandle ? dirHandle.name : `Загрузки/${safeFolder(S.folder) || 'ChatGPT_Images'}`;
+    ui.dirInfo.title = dirHandle ? `Файлы сохраняются в папку «${dirHandle.name}»` : 'Папка по умолчанию в «Загрузках»';
+    ui.pickDir.textContent = dirHandle ? 'Другая папка' : 'Выбрать папку';
+    ui.clearDir.classList.toggle('hidden', !dirHandle);
+  }
+  ui.pickDir.addEventListener('click', async () => {
+    if (run.active) return;
+    if (typeof showDirectoryPicker !== 'function') { flash('Этот браузер не умеет выбирать папку'); return; }
+    try {
+      const h = await showDirectoryPicker({ id: 'cgptBatch', mode: 'readwrite' });
+      await idbOp('readwrite', (st) => st.put(h, 'dir'));
+      dirHandle = h;
+      log(`Папка для скачивания: ${h.name}`, 'info');
+    } catch (e) { if (e.name !== 'AbortError') log(`Не удалось выбрать папку: ${e.message}`, 'err'); }
+    refreshDir();
+  });
+  ui.clearDir.addEventListener('click', async () => {
+    if (run.active) return;
+    try { await idbOp('readwrite', (st) => st.delete('dir')); } catch { /* ignore */ }
+    dirHandle = null; refreshDir();
+  });
   ui.pickWord.addEventListener('click', () => ui.wordDoc.click());
   ui.wordDoc.addEventListener('change', async () => {
     const f = ui.wordDoc.files[0];
@@ -2317,9 +2397,11 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
 
   (async () => {
     await load();
+    await loadDirHandle();
     document.documentElement.appendChild(host);
     syncTheme();
     fillForm();
+    refreshDir();
     updateButtons();
     ready = true;
     if (openRequested) setOpen(true);

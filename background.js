@@ -119,3 +119,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true; // ответ асинхронный
   }
 });
+
+// Байты картинки для записи в выбранную папку: из страницы ChatGPT их не взять (CORS), а отсюда можно
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || msg.type !== 'fetchBytes') return;
+  (async () => {
+    try {
+      const r = await fetch(msg.url, { credentials: 'include' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const buf = new Uint8Array(await r.arrayBuffer());
+      let bin = '';
+      for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+      sendResponse({ ok: true, b64: btoa(bin) });
+    } catch (e) { sendResponse({ ok: false, error: e.message }); }
+  })();
+  return true;
+});
