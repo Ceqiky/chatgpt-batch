@@ -106,7 +106,7 @@ DO NOT: add any new element, text or decoration; move, resize, restyle, recolour
 RESULT: the same scene, isolated on a clean pure black background — only the objects, their lines and arrows, shadows and native glow — ready for compositing with the Screen blend mode. Clean edges, no dark halo or grey fringe around objects.`,
     editSuffix: '_black', followUp: false, editOpen: false,
     libName: '', notify: true, skipFailed: true, perRunFolder: true, onlyFinal: true,
-    runFolder: '', csvName: '', failed: [], resultsMap: {},
+    runFolder: '', csvName: '', failed: [], resultsMap: {}, savedKeys: [],
     open: true, settingsOpen: false, logOpen: true, pos: null,
   };
   let S = { ...DEFAULTS };
@@ -127,18 +127,50 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   }
   let shadowRef = null;
 
+  // Настройки общие для всех вкладок, а промпты и прогресс очереди — свои у каждой вкладки,
+  // чтобы в разных чатах можно было вести отдельные очереди одновременно.
+  const TAB_FIELDS = ['text', 'sep', 'prefix', 'names', 'refs', 'wordRows', 'startFrom', 'csvName', 'runFolder', 'failed', 'resultsMap', 'savedKeys'];
+  const TAB_TTL = 14 * 24 * 3600 * 1000;
+  const tabId = (() => {
+    try {
+      let id = sessionStorage.getItem('cgptBatchTab');
+      if (!id) { id = Math.random().toString(36).slice(2, 10) + Date.now().toString(36); sessionStorage.setItem('cgptBatchTab', id); }
+      return id;
+    } catch { return Math.random().toString(36).slice(2, 10); }
+  })();
+  const TAB_KEY = `${STORE_KEY}:tab:${tabId}`;
+
   const save = () => {
     if (!extAlive()) { retire(); return; }
-    try { chrome.storage.local.set({ [STORE_KEY]: S }).catch(() => {}); } catch { retire(); }
+    const shared = {}, tab = { _ts: Date.now() };
+    for (const k of Object.keys(S)) (TAB_FIELDS.includes(k) ? tab : shared)[k] = S[k];
+    try { chrome.storage.local.set({ [STORE_KEY]: shared, [TAB_KEY]: tab }).catch(() => {}); } catch { retire(); }
   };
   const load = async () => {
     try {
-      const data = await chrome.storage.local.get(STORE_KEY);
-      S = { ...DEFAULTS, ...(data[STORE_KEY] || {}) };
+      const data = await chrome.storage.local.get([STORE_KEY, TAB_KEY]);
+      const shared = { ...(data[STORE_KEY] || {}) };
+      const tab = data[TAB_KEY];
+      // Первый запуск после обновления: промпты и прогресс лежали в общих настройках — берём их этой вкладке
+      // (при следующем сохранении они из общих уходят, так что достанутся только одной вкладке)
+      const seed = {};
+      if (!tab) for (const k of TAB_FIELDS) if (k in shared) seed[k] = shared[k];
+      for (const k of TAB_FIELDS) delete shared[k];
+      S = { ...DEFAULTS, ...shared, ...seed, ...(tab || {}) };
+      delete S._ts;
       // Старый короткий шаблон доработки (если пользователь его не менял) → новый
       if ((S.editPrompt || '').startsWith('Edit this image. Remove ALL text: headlines')) S.editPrompt = DEFAULTS.editPrompt;
+      pruneTabs();
     } catch { S = { ...DEFAULTS }; }
   };
+  // Записи закрытых вкладок не копим
+  async function pruneTabs() {
+    try {
+      const all = await chrome.storage.local.get(null);
+      const old = Object.keys(all).filter((k) => k.startsWith(`${STORE_KEY}:tab:`) && k !== TAB_KEY && !((all[k] && all[k]._ts) > Date.now() - TAB_TTL));
+      if (old.length) await chrome.storage.local.remove(old);
+    } catch { /* не критично */ }
+  }
 
   // Время последнего изменения страницы — чтобы понять, что ответ «успокоился»
   let lastMut = Date.now();
