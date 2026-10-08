@@ -730,10 +730,16 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       if (id && target) rels[id] = target.startsWith('/') ? target.slice(1) : 'word/' + target;
     }
     const out = [];
+    let section = '';
     for (const row of xml.matchAll(/<w:tr[\s>][\s\S]*?<\/w:tr>/g)) {
       const cells = [...row[0].matchAll(/<w:tc\b[^>]*>([\s\S]*?)<\/w:tc>/g)].map((c) => c[1]);
       const ids = [...row[0].matchAll(/r:(?:embed|id)="(rId\d+)"/g)].map((m) => m[1]).filter((id) => /\.(png|jpe?g|gif|webp)$/i.test(rels[id] || ''));
-      if (!ids.length) continue;
+      if (!ids.length) {
+        // Строка из одной ячейки («Сценарий к слайдам», «Сценарий к подробнее») — заголовок раздела
+        const t = cells.length === 1 ? cellText(cells[0]).replace(/\s+/g, ' ').trim() : '';
+        if (t) section = t;
+        continue;
+      }
       const texts = cells.map(cellText);
       const imgCell = cells.findIndex((c) => /r:(?:embed|id)="rId\d+"/.test(c));
       const path = rels[ids[0]];
@@ -742,8 +748,13 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       const ext = path.split('.').pop().toLowerCase();
       const label = (texts[0] || '').trim() || `Строка ${out.length + 1}`;
       const file = new File([bytes], `${String(out.length + 1).padStart(2, '0')}_${slug(label)}.${ext}`, { type: MIME[ext] || 'image/png' });
-      out.push({ label, title: (texts[1] || '').trim(), desc: (texts[imgCell] || texts[texts.length - 1] || '').trim(), file });
+      out.push({ label, section, title: (texts[1] || '').trim(), desc: (texts[imgCell] || texts[texts.length - 1] || '').trim(), file });
     }
+    // Названия «1», «2», «1», «2» (по разделам) нельзя искать в тексте промпта: цифра есть в любом тексте.
+    // Такие строки подбираем по порядку.
+    const cnt = {};
+    out.forEach((r) => { cnt[labelKey(r.label)] = (cnt[labelKey(r.label)] || 0) + 1; });
+    out.forEach((r) => { r.vague = /^\d+$/.test(r.label.trim()) || cnt[labelKey(r.label)] > 1; });
     return out;
   }
 
@@ -757,14 +768,15 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     const prompts = parsePrompts(S.text, S.sep);
     const col = S.wordRows && S.wordRows.length === prompts.length ? S.wordRows[i] : '';
     if (col) {
-      const r = rows.find((x) => labelKey(x.label) === labelKey(col));
+      const r = rows.find((x) => labelKey(x.label) === labelKey(col) && !x.vague)
+        || rows.find((x) => labelKey(`${x.section} ${x.label}`) === labelKey(col));
       if (r) return { row: r, how: 'колонка «строка_в_Word»' };
     }
     const t = labelKey(prompts[i] || '');
     let loose = null;
     for (const r of rows) {
       const L = labelKey(r.label);
-      if (!L) continue;
+      if (!L || r.vague) continue;
       if (t.includes(`«${L}»`) || t.includes(`"${L}"`)) return { row: r, how: 'упоминание в промпте' };
       if (!loose && new RegExp(`(^|[^\\p{L}\\p{N}])${escRe(L)}(?!\\p{N})`, 'u').test(t)) loose = r;
     }
@@ -780,7 +792,12 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     const want = refsValid && S.refs[i];
     if (want) {
       const b = baseName(want);
-      return files.refs.get(b) || files.refs.get(stripExt(b)) || null;
+      const hit = files.refs.get(b) || files.refs.get(stripExt(b));
+      if (hit) return hit;
+      // Имя расходится только знаками/регистром/расширением (che-sld1.jpg ↔ che_sld1.png)
+      const flat = (n) => stripExt(n).replace(/[^\p{L}\p{N}]+/gu, '');
+      for (const [name, f] of files.refs) if (flat(name) === flat(b)) return f;
+      return null;
     }
     const num = i + 1;
     for (const [name, f] of files.refs) {
@@ -2176,6 +2193,13 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     files.refSource = 'folder';
     log(`Папка с референсами: ${uniq} файлов`, 'info');
     refreshFiles();
+    // Какие имена из CSV не нашлись в папке — сразу видно, а не посреди запуска
+    const n = parsePrompts(S.text, S.sep).length;
+    if (S.refs && S.refs.length === n) {
+      const miss = [];
+      for (let i = 0; i < n; i++) if (S.refs[i] && !refFor(i)) miss.push(`#${i + 1} «${S.refs[i]}»`);
+      if (miss.length) log(`В папке нет референсов: ${miss.join(', ')}. В папке есть: ${[...new Set(files.refs.values())].map((f) => f.name).join(', ')}`, 'warn');
+    }
   });
   // Доработка готовых картинок
   ui.pickEdit.addEventListener('click', () => ui.editDir.click());
