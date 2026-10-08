@@ -1221,7 +1221,14 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       // 6) Результат
       if (!S.waitImage) { log(`${job.label} готово`, 'ok'); return { ok: true, imgs: 0, names: [] }; }
       const imgs = newImages(before).filter(imgUsable);
-      if (!imgs.length) { lastReason = 'картинка не появилась'; log(`${job.label}: картинка не появилась`, 'err'); continue; }
+      if (!imgs.length) {
+        // Что ChatGPT ответил вместо картинки: без этого причину сбоя не видно
+        const answers = $$('[data-message-author-role="assistant"]');
+        const said = answers.length > assist ? norm(answers[answers.length - 1].textContent || '').slice(0, 300) : '';
+        lastReason = 'картинка не появилась';
+        log(`${job.label}: картинка не появилась${said ? ` — ChatGPT ответил: «${said}»` : ' — ответа ChatGPT в чате нет'}`, 'err');
+        continue;
+      }
       if (S.download) {
         setStatus('gen', 'Скачивание');
         const d = await downloadImgs(imgs, job);
