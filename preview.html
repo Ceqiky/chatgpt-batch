@@ -148,7 +148,7 @@ render();
 // ── Заглушка chrome.* ──
 const store = {}; window.__downloads = [];
 window.chrome = { storage: { local: { get: async k => ({ [k]: store[k] }), set: async o => Object.assign(store, o) } },
-  runtime: { id: 'mock', getManifest: () => ({ version: '1.5.0' }), connect: () => { const l = [], d = []; window.__ticks = 0;
+  runtime: { id: 'mock', getManifest: () => ({ version: '1.5.1' }), connect: () => { const l = [], d = []; window.__ticks = 0;
       const t = setInterval(() => { window.__ticks++; l.forEach(f => f('tick')); }, 500);
       return { onMessage: { addListener: f => l.push(f) }, onDisconnect: { addListener: f => d.push(f) },
         postMessage() {}, disconnect() { clearInterval(t); } }; },

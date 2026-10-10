@@ -336,9 +336,22 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   }
   // Поле ввода запоминаем: искать его заново (7 селекторов + стили) нужно, только если ChatGPT его перерисовал
   let inputCache = null;
+  // В новом интерфейсе на странице несколько contenteditable: поля правки старых сообщений
+  // («Редактировать сообщение», «Начните вводить текст») лежат внутри ходов диалога. Нужно нижнее поле — настоящий композер.
+  const IN_MESSAGE = 'article, [data-message-author-role], [data-testid^="conversation-turn"], [data-turn], [data-turn-id]';
+  const MAIN_LABEL_RE = /(спросить|ask|message|сообщение chatgpt|send a message|напишите)/i;
+  const pickInput = () => {
+    const vis = inputCandidates().filter(isVisible);
+    const main = vis.filter((el) => !el.closest(IN_MESSAGE));
+    const pool = main.length ? main : vis;
+    const label = (el) => (MAIN_LABEL_RE.test(el.getAttribute('aria-label') || el.getAttribute('placeholder') || '') ? 1 : 0)
+      + (/редактировать|edit/i.test(el.getAttribute('aria-label') || '') ? -2 : 0);
+    return pool.sort((a, b) => label(b) - label(a) || b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom)[0] || null;
+  };
   const findInput = () => {
-    if (inputCache && inputCache.isConnected && isVisible(inputCache)) return inputCache;
-    inputCache = inputCandidates().find(isVisible) || null;
+    // Запомненное поле годится, только если оно не из сообщения (иначе после обновления вёрстки застрянем на чужом)
+    if (inputCache && inputCache.isConnected && isVisible(inputCache) && !inputCache.closest(IN_MESSAGE)) return inputCache;
+    inputCache = pickInput();
     return inputCache;
   };
   const inputText = (el) => (el ? (el.tagName === 'TEXTAREA' ? el.value : el.innerText) : '');
@@ -349,7 +362,12 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       .filter((b) => !seen.has(b) && seen.add(b))
       .filter((b) => b.getAttribute('data-testid') !== 'stop-button');
   }
-  const findSend = () => sendCandidates().find((b) => isVisible(b) && !b.disabled && b.getAttribute('aria-disabled') !== 'true') || null;
+  const findSend = () => {
+    const ok = sendCandidates().filter((b) => isVisible(b) && !b.disabled && b.getAttribute('aria-disabled') !== 'true');
+    // Кнопка «отправить» — из того же композера, что и поле ввода (а не из правки старого сообщения)
+    const root = composerRoot();
+    return (root && ok.find((b) => root.contains(b))) || ok.find((b) => !b.closest(IN_MESSAGE)) || ok[0] || null;
+  };
 
   // Текст в поле совпадает с промптом (с допуском на пробелы/переносы)
   function textMatches(el, text) {
