@@ -84,7 +84,7 @@
     text: '', sep: 'line', prefix: '',
     delayMin: 5, delayMax: 10,
     waitImage: true, download: true, folder: 'ChatGPT_Images',
-    retries: 1, timeoutMin: 10, startFrom: 1, names: [], refs: [], wordRows: [], commonMode: 'first', debug: false,
+    retries: 1, timeoutMin: 10, startFrom: 1, editStart: 1, names: [], refs: [], wordRows: [], commonMode: 'first', debug: false,
     editPrompt: `Edit this image using targeted inpainting — do NOT re-render or redraw the scene. Treat the image as a fixed plate: only the regions listed under REMOVE may change; every other pixel must stay as close to the original as possible.
 
 REMOVE completely (fill every freed area with the plain black background — never with new objects or texture):
@@ -129,7 +129,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
 
   // Настройки общие для всех вкладок, а промпты и прогресс очереди — свои у каждой вкладки,
   // чтобы в разных чатах можно было вести отдельные очереди одновременно.
-  const TAB_FIELDS = ['text', 'sep', 'prefix', 'names', 'refs', 'wordRows', 'startFrom', 'csvName', 'runFolder', 'failed', 'resultsMap', 'savedKeys'];
+  const TAB_FIELDS = ['text', 'sep', 'prefix', 'names', 'refs', 'wordRows', 'startFrom', 'editStart', 'csvName', 'runFolder', 'failed', 'resultsMap', 'savedKeys'];
   const TAB_TTL = 14 * 24 * 3600 * 1000;
   const tabId = (() => {
     try {
@@ -1452,7 +1452,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     updateButtons();
 
     // С какого места идём
-    let i = (isEdit || isRetry) ? 0 : Math.min(Math.max(0, (parseInt(S.startFrom, 10) || 1) - 1), jobs.length - 1);
+    let i = isEdit ? Math.min(Math.max(0, (parseInt(S.editStart, 10) || 1) - 1), jobs.length - 1) : isRetry ? 0 : Math.min(Math.max(0, (parseInt(S.startFrom, 10) || 1) - 1), jobs.length - 1);
     const startIdx = i;
     const freshStart = !isEdit && !isRetry && (parseInt(S.startFrom, 10) || 1) <= 1;
     if (!isEdit) jobs.forEach((j, k) => { j.attach = () => attachmentsFor(j.num - 1, k === startIdx); });
@@ -1474,7 +1474,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     let okCount = 0, imgCount = 0, refusedCount = 0, errCount = 0, streak = 0;
     const t0 = Date.now();
     if (isEdit) {
-      log(`Доработка: ${jobs.length} картинок, суффикс «${S.editSuffix || ''}»`, 'info');
+      log(`Доработка: ${jobs.length} картинок, начиная с ✎${i + 1}, суффикс «${S.editSuffix || ''}»`, 'info');
     } else {
       if (S.refs && S.refs.length === jobs.length && S.refs.some(Boolean) && !files.refs.size) log('В CSV есть колонка референсов, но папка с ними не выбрана — промпты пойдут без референсов', 'warn');
       if (files.common.length) log(`Общие файлы: ${files.common.map((f) => f.name).join(', ')} — ${S.commonMode === 'each' ? 'к каждому промпту' : 'к первому промпту'}`, 'info');
@@ -1543,6 +1543,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
 
         S.failed = [...failedSet];
         if (!isEdit && !isRetry) S.startFrom = i + 2;
+        if (isEdit) S.editStart = i + 2;
         save(); syncStartField();
         setProgress(i + 1, jobs.length);
 
@@ -1568,9 +1569,10 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       notify(failedSet.size ? 'Готово, есть пропущенные' : 'Готово', `${parts.join(' · ')} за ${took}`);
       setCurrent(null);
       if (!isEdit && !isRetry) S.startFrom = 1;
+      if (isEdit) S.editStart = 1;
     } catch (e) {
       if (e.message === 'STOP') {
-        log(isEdit || isRetry ? 'Остановлено' : `Остановлено. Продолжить можно с №${S.startFrom}`, 'warn');
+        log(isRetry ? 'Остановлено' : isEdit ? `Остановлено. Доработку можно продолжить с картинки №${S.editStart}` : `Остановлено. Продолжить можно с №${S.startFrom}`, 'warn');
         setStatus('idle', 'Остановлено');
       } else {
         log(`Ошибка: ${e.message}`, 'err'); setStatus('error', 'Ошибка');
@@ -1865,6 +1867,10 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
               <label>Суффикс к имени файла</label>
               <input class="inp" data-k="editSuffix" placeholder="_black">
             </div>
+            <div class="field">
+              <label>Начать с картинки №</label>
+              <input class="inp num" type="number" min="1" data-k="editStart">
+            </div>
             <label class="sw-row">
               <div><div class="t">После каждой генерации</div><div class="d">Сразу отправлять доработку в тот же чат и скачать обе версии</div></div>
               <span class="sw"><input type="checkbox" data-k="followUp"><span></span></span>
@@ -2097,8 +2103,10 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     return m10 === 1 && m100 !== 11 ? a : (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? b : c);
   };
   function syncStartField() {
-    const f = ui.fields.find((x) => x.dataset.k === 'startFrom');
-    if (f) f.value = S.startFrom;
+    for (const k of ['startFrom', 'editStart']) {
+      const f = ui.fields.find((x) => x.dataset.k === k);
+      if (f) f.value = S[k];
+    }
   }
   function setProgress(done, total) {
     ui.bar.style.width = `${total ? (done / total) * 100 : 0}%`;
