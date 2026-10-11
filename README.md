@@ -2,7 +2,7 @@
 
 Расширение Chrome, которое отправляет промпты в ChatGPT по очереди, ждёт окончания генерации и скачивает картинки.
 
-**Версия 1.5.3** · [Что нового](CHANGELOG.md) · [Скачать ZIP](https://github.com/Ceqiky/chatgpt-batch/archive/refs/heads/main.zip)
+**Версия 1.5.4** · [Что нового](CHANGELOG.md) · [Скачать ZIP](https://github.com/Ceqiky/chatgpt-batch/archive/refs/heads/main.zip)
 
 ## Возможности
 

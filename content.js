@@ -308,13 +308,20 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   // Очередь привязана к чату, в котором её запустили: перешли в другой — останавливаемся,
   // а не начинаем слать промпты туда. Пустой чат (/) после первой отправки становится /c/<id> — это тот же чат.
   const chatPath = () => location.pathname.replace(/\/+$/, '') || '/';
+  const chatId = (p) => (p.match(/\/c\/([0-9a-f-]{8,})/i) || [])[1] || '';
   function checkChat() {
     if (!run.chatPath) return;
     const cur = chatPath();
-    if (cur === run.chatPath) return;
-    if (!run.chatPath.startsWith('/c/') && cur.startsWith('/c/')) { run.chatPath = cur; return; }
+    if (cur === run.chatPath) { run.diffSince = 0; return; }
+    const curId = chatId(cur), wasId = chatId(run.chatPath);
+    // Новый чат: адрес меняется сам («/» → «/c/id», временный id → настоящий). Это тот же чат —
+    // первые 90 с после старта в пустом чате принимаем любой новый адрес с id.
+    if (curId && (!wasId || Date.now() < (run.freshUntil || 0))) { run.chatPath = cur; run.diffSince = 0; return; }
+    // Адрес мог мигнуть на миг — останавливаемся, только если он не вернулся 2 с
+    if (!run.diffSince) run.diffSince = Date.now();
+    if (Date.now() - run.diffSince < 2000) return;
     run.stop = true; run.paused = false;
-    log('Вы перешли в другой чат — очередь остановлена. Вернитесь в нужный чат и нажмите «Продолжить»', 'warn');
+    log(`Вы перешли в другой чат — очередь остановлена (было ${run.chatPath}, стало ${cur}). Вернитесь в нужный чат и нажмите «Продолжить»`, 'warn');
   }
   function checkStop() { checkChat(); if (run.stop) throw new Error('STOP'); }
   async function waitPause() { while (run.paused) { checkStop(); await sleep(300); } }
@@ -1447,7 +1454,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     if (!findInput()) { flash('Поле ввода ChatGPT не найдено — нажмите «Проверить поле»'); dbg('Старт: поле не найдено', diag()); return; }
     dbg('Старт', diag());
 
-    run.active = true; run.paused = false; run.stop = false; run.chatPath = chatPath();
+    run.active = true; run.paused = false; run.stop = false; run.chatPath = chatPath(); run.diffSince = 0; run.freshUntil = assistCount() === 0 ? Date.now() + 90000 : 0;
     startTicker();
     updateButtons();
 
