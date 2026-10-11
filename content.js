@@ -284,9 +284,20 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   }
 
   // Новые картинки (которых не было до отправки), без дублей по src
-  // Превью файла, который мы сами прикрепили, лежит в сообщении пользователя как data:/blob:-картинка.
-  // Раньше оно считалось «новой картинкой»: при отказе/лимите ChatGPT расширение скачивало свой же оригинал как результат.
-  let ignoreLocalImgs = false;
+  // Результат в новой вёрстке ChatGPT приходит как data:-картинка (раньше — https), поэтому запрещать data: нельзя.
+  // Превью файла, который мы сами прикрепили, тоже data:-картинка. Узнаём его по содержимому: base64 прикреплённого
+  // файла совпадает с картинкой на странице. Если не совпало (превью перекодировано), страхуемся правилом ниже.
+  let attachSigs = [], attachedN = 0;
+  async function fileSig(file) {
+    const url = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(file); });
+    const pl = url.slice(url.indexOf(',') + 1);
+    return { len: pl.length, head: pl.slice(0, 80), tail: pl.slice(-80) };
+  }
+  const isOwnPreview = (s) => {
+    if (!s.startsWith('data:') || !attachSigs.length) return false;
+    const pl = s.slice(s.indexOf(',') + 1);
+    return attachSigs.some((g) => pl.length === g.len && pl.startsWith(g.head) && pl.endsWith(g.tail));
+  };
   // Идентификатор файла в адресе (file-xxxx / file_xxxx). Только он годится для сравнения «та же картинка» —
   // запасной ключ из пути у разных картинок одинаковый и «съедал» все новые.
   const fileId = (src) => (src.match(/file[-_][A-Za-z0-9]+/) || [])[0] || '';
@@ -294,18 +305,23 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   // relaxed: запасной проход, если строгий ничего не нашёл — только сравнение по адресу, без правила про идентификатор
   function newImages(before, relaxed = false) {
     const seen = new Set();
-    return allImgs().filter((i) => {
+    let own = 0;
+    const list = allImgs().filter((i) => {
       const s = srcOf(i);
       if (before.has(s) || seen.has(s)) return false;
       // та же картинка могла перерисоваться с другим адресом — сравниваем по идентификатору файла
       if (!relaxed) { const id = fileId(s); if (id && before.has('id:' + id)) return false; }
-      if (ignoreLocalImgs && /^(data:|blob:)/.test(s)) return false;
+      if (isOwnPreview(s)) { own++; return false; }
       if (i.complete && i.naturalWidth && i.naturalWidth < MIN_IMG_SIZE) return false;
       // В фоновой вкладке «ленивые» картинки могут не грузиться — заставляем
       if (i.loading === 'lazy') i.loading = 'eager';
       seen.add(s);
       return true;
     });
+    // С вложением на странице всегда есть его превью. Одна-единственная data:-картинка, не опознанная как превью, —
+    // это почти наверняка оно само (ответа ещё нет или это отказ/лимит), а не результат.
+    if (attachedN > 0 && !own && list.length === 1 && /^data:/.test(srcOf(list[0]))) return [];
+    return list;
   }
   const imgReady = (i) => i.complete && i.naturalWidth >= MIN_IMG_SIZE;
   const hasRealSrc = (i) => /^(https?:|blob:|data:image\/(?!svg))/.test(srcOf(i));
@@ -1389,7 +1405,9 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
 
       // 2) Вложения с компьютера (Word, референсы)
       const att = job.attach ? job.attach() : [];
-      ignoreLocalImgs = att.length > 0 || libRefs.length > 0;
+      attachedN = att.length + libRefs.length;
+      attachSigs = [];
+      try { attachSigs = await Promise.all(att.map(fileSig)); } catch { /* без подписи — сработает запасное правило */ }
       if (att.length) {
         setStatus('gen', `Прикрепляю файлы (${att.length})`);
         try { await attachFiles(att); } catch (e) {
