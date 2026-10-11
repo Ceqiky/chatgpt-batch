@@ -269,11 +269,16 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   }
 
   // Новые картинки (которых не было до отправки), без дублей по src
+  // Превью файла, который мы сами прикрепили, лежит в сообщении пользователя как data:/blob:-картинка.
+  // Раньше оно считалось «новой картинкой»: при отказе/лимите ChatGPT расширение скачивало свой же оригинал как результат.
+  let ignoreLocalImgs = false;
   function newImages(before) {
     const seen = new Set();
     return allImgs().filter((i) => {
       const s = srcOf(i);
-      if (before.has(s) || seen.has(s)) return false;
+      // та же картинка могла перерисоваться с другим адресом — сравниваем и по идентификатору файла
+      if (before.has(s) || before.has(imageKey(s)) || seen.has(s)) return false;
+      if (ignoreLocalImgs && /^(data:|blob:)/.test(s)) return false;
       if (i.complete && i.naturalWidth && i.naturalWidth < MIN_IMG_SIZE) return false;
       // В фоновой вкладке «ленивые» картинки могут не грузиться — заставляем
       if (i.loading === 'lazy') i.loading = 'eager';
@@ -1016,7 +1021,17 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   // Сколько ждать: «через 3 минуты», «in 2 hours»; если не указано — 15 минут
   function parseWaitMs(t) {
     const m = t.match(/(\d+(?:[.,]\d+)?)\s*(секунд\w*|сек\b|seconds?|secs?|минут\w*|мин\b|minutes?|mins?|час\w*|hours?|hrs?)/i);
-    if (!m) return 15 * 60000;
+    if (!m) {
+      // «Попробуйте снова в 18:10» — ждём до этого времени (если оно уже прошло — до завтрашнего)
+      const a = t.match(/(?:\bв|\bat|после|until)\s*(\d{1,2}):(\d{2})/i);
+      if (a) {
+        const now = new Date(), at = new Date(now);
+        at.setHours(+a[1], +a[2], 0, 0);
+        if (at <= now) at.setDate(at.getDate() + 1);
+        return at - now + 60000;
+      }
+      return 15 * 60000;
+    }
     const n = parseFloat(m[1].replace(',', '.')), u = m[2].toLowerCase();
     const mult = /^(сек|sec)/.test(u) ? 1000 : /^(мин|min)/.test(u) ? 60000 : 3600000;
     return Math.round(n * mult) + 5000;
@@ -1302,7 +1317,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       }
       setStatus('gen', 'Ждём, пока ChatGPT освободится');
       await waitIdle();
-      const before = new Set(allImgs().map(srcOf));
+      const before = new Set(allImgs().flatMap((i) => [srcOf(i), imageKey(srcOf(i))]));
       const turns = countTurns();
       const assist = assistCount();
 
@@ -1312,6 +1327,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
 
       // 2) Вложения с компьютера (Word, референсы)
       const att = job.attach ? job.attach() : [];
+      ignoreLocalImgs = att.length > 0 || libRefs.length > 0;
       if (att.length) {
         setStatus('gen', `Прикрепляю файлы (${att.length})`);
         try { await attachFiles(att); } catch (e) {
