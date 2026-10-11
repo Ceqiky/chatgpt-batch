@@ -272,12 +272,18 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   // Превью файла, который мы сами прикрепили, лежит в сообщении пользователя как data:/blob:-картинка.
   // Раньше оно считалось «новой картинкой»: при отказе/лимите ChatGPT расширение скачивало свой же оригинал как результат.
   let ignoreLocalImgs = false;
-  function newImages(before) {
+  // Идентификатор файла в адресе (file-xxxx / file_xxxx). Только он годится для сравнения «та же картинка» —
+  // запасной ключ из пути у разных картинок одинаковый и «съедал» все новые.
+  const fileId = (src) => (src.match(/file[-_][A-Za-z0-9]+/) || [])[0] || '';
+  const beforeKeys = (imgs) => new Set(imgs.flatMap((i) => { const s = srcOf(i), id = fileId(s); return id ? [s, 'id:' + id] : [s]; }));
+  // relaxed: запасной проход, если строгий ничего не нашёл — только сравнение по адресу, без правила про идентификатор
+  function newImages(before, relaxed = false) {
     const seen = new Set();
     return allImgs().filter((i) => {
       const s = srcOf(i);
-      // та же картинка могла перерисоваться с другим адресом — сравниваем и по идентификатору файла
-      if (before.has(s) || before.has(imageKey(s)) || seen.has(s)) return false;
+      if (before.has(s) || seen.has(s)) return false;
+      // та же картинка могла перерисоваться с другим адресом — сравниваем по идентификатору файла
+      if (!relaxed) { const id = fileId(s); if (id && before.has('id:' + id)) return false; }
       if (ignoreLocalImgs && /^(data:|blob:)/.test(s)) return false;
       if (i.complete && i.naturalWidth && i.naturalWidth < MIN_IMG_SIZE) return false;
       // В фоновой вкладке «ленивые» картинки могут не грузиться — заставляем
@@ -1336,7 +1342,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       }
       setStatus('gen', 'Ждём, пока ChatGPT освободится');
       await waitIdle();
-      const before = new Set(allImgs().flatMap((i) => [srcOf(i), imageKey(srcOf(i))]));
+      const before = beforeKeys(allImgs());
       pageBefore = pageText(); sentNorm = '';
       const turns = countTurns();
       const assist = assistCount();
@@ -1405,8 +1411,12 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
 
       // 6) Результат
       if (!S.waitImage) { log(`${job.label} готово`, 'ok'); return { ok: true, imgs: 0, names: [] }; }
-      const imgs = newImages(before).filter(imgUsable);
+      let imgs = newImages(before).filter(imgUsable);
+      if (!imgs.length) imgs = newImages(before, true).filter(imgUsable);
       if (!imgs.length) {
+        // Что на странице нового и почему не подошло — чтобы понять, чего не видит расширение
+        dbg('Нет картинок. Новые по адресу', allImgs().filter((i) => !before.has(srcOf(i))).slice(0, 12)
+          .map((i) => `${srcOf(i).slice(0, 70)} | ${i.naturalWidth}×${i.naturalHeight} | ${i.complete ? 'loaded' : 'loading'} | ${i.closest('button') ? 'в кнопке' : 'не в кнопке'}`));
         // Что ChatGPT ответил вместо картинки: без этого причину сбоя не видно
         const answers = $$('[data-message-author-role="assistant"]');
         const said = (answers.length > assist ? norm(answers[answers.length - 1].textContent || '') : newPageText()).slice(0, 300);
