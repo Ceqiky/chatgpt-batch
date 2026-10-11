@@ -253,14 +253,29 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   const isGenerating = () => !!$(SEL.stop);
   const countTurns = () => Math.max($$(SEL.turn).length, $$(SEL.msg).length);
 
+  // Результат может быть показан не тегом <img>, а блоком с background-image: превращаем такой адрес в Image
+  const bgCache = new Map();
+  function bgImgs(root) {
+    const out = [];
+    for (const el of $$('[style*="background-image"]', root)) {
+      const m = (el.getAttribute('style') || '').match(/url\(["']?([^"')]+)["']?\)/);
+      if (!m || !/^(https?:|blob:)/.test(m[1])) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 300 || r.height < 200) continue;
+      let im = bgCache.get(m[1]);
+      if (!im) { im = new Image(); im.src = m[1]; bgCache.set(m[1], im); }
+      out.push(im);
+    }
+    return out;
+  }
   function allImgs() {
     const root = $('main') || document.body;
     const composer = composerRoot();
-    return $$('img', root).filter((i) => {
+    return [...$$('img', root), ...bgImgs(root)].filter((i) => {
       const s = srcOf(i);
       if (!s || s.startsWith('data:image/svg')) return false;
       // не считаем картинки из поля ввода (превью вложений) и из сообщений пользователя (референсы)
-      if (composer && composer.contains(i)) return false;
+      if (composer && i.isConnected && composer.contains(i)) return false;
       if (i.closest('[data-message-author-role="user"], [data-turn="user"]')) return false;
       const turn = i.closest(SEL.turn);
       if (turn && turn.querySelector('[data-message-author-role="user"]') && !turn.querySelector('[data-message-author-role="assistant"]')) return false;
@@ -1335,6 +1350,21 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     const libRefs = !job.useLib ? [] : split.refs.length ? [...new Set(split.refs)] : [libNameClean()].filter(Boolean);
     const text = split.text;
 
+    // Скачивание найденных картинок и итог промпта (общее для обычного пути и для «нашлась с опозданием»)
+    async function finish(imgs) {
+      if (S.download) {
+        setStatus('gen', 'Скачивание');
+        const d = await downloadImgs(imgs, job);
+        const note = [d.skipped ? `дубль пропущен: ${d.skipped}` : '', d.failed ? `НЕ СКАЧАНО: ${d.failed}` : ''].filter(Boolean).join(' · ');
+        log(`${job.label} готово · скачано ${d.saved} из ${d.total}${d.names.length ? ' → ' + d.names.join(', ') : ''}${note ? ' · ' + note : ''}`, d.failed ? 'warn' : 'ok');
+        return { ok: true, imgs: d.saved, names: d.names, dlFailed: d.failed };
+      }
+      log(`${job.label} готово · картинок: ${uniqueImgs(imgs).length}`, 'ok');
+      return { ok: true, imgs: uniqueImgs(imgs).length, names: [] };
+    }
+    // Снимок картинок берём один раз на промпт: результат прошлой попытки, появившийся с опозданием, остаётся «новым»
+    let firstBefore = null;
+
     for (let attempt = 0; attempt <= S.retries; attempt++) {
       if (attempt > 0) {
         log(`${job.label}: повтор ${attempt} из ${S.retries}`, 'warn');
@@ -1342,7 +1372,13 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       }
       setStatus('gen', 'Ждём, пока ChatGPT освободится');
       await waitIdle();
-      const before = beforeKeys(allImgs());
+      const before = firstBefore || (firstBefore = beforeKeys(allImgs()));
+      // Прошлая попытка могла дать картинку с опозданием — берём её и не шлём промпт второй раз (иначе две генерации)
+      if (attempt > 0 && S.waitImage) {
+        let late = newImages(before).filter(imgUsable);
+        if (!late.length) late = newImages(before, true).filter(imgUsable);
+        if (late.length) { log(`${job.label}: картинка прошлой попытки нашлась — повторно не отправляю`, 'info'); return await finish(late); }
+      }
       pageBefore = pageText(); sentNorm = '';
       const turns = countTurns();
       const assist = assistCount();
@@ -1415,6 +1451,11 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       if (!imgs.length) imgs = newImages(before, true).filter(imgUsable);
       if (!imgs.length) {
         // Что на странице нового и почему не подошло — чтобы понять, чего не видит расширение
+        dbg('Нет картинок. Другие элементы в main', {
+          canvas: $$('canvas', $('main') || document).map((c) => `${c.width}×${c.height}`).slice(0, 6),
+          bg: $$('[style*="background-image"]', $('main') || document).map((e) => `${Math.round(e.getBoundingClientRect().width)}×${Math.round(e.getBoundingClientRect().height)} ${(e.getAttribute('style') || '').slice(0, 90)}`).slice(0, 6),
+          picture: $$('picture source', $('main') || document).length, video: $$('video', $('main') || document).length,
+        });
         dbg('Нет картинок. Новые по адресу', allImgs().filter((i) => !before.has(srcOf(i))).slice(0, 12)
           .map((i) => `${srcOf(i).slice(0, 70)} | ${i.naturalWidth}×${i.naturalHeight} | ${i.complete ? 'loaded' : 'loading'} | ${i.closest('button') ? 'в кнопке' : 'не в кнопке'}`));
         // Что ChatGPT ответил вместо картинки: без этого причину сбоя не видно
@@ -1424,15 +1465,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
         log(`${job.label}: картинка не появилась${said ? ` — ChatGPT ответил: «${said}»` : ' — ответа ChatGPT в чате нет'}`, 'err');
         continue;
       }
-      if (S.download) {
-        setStatus('gen', 'Скачивание');
-        const d = await downloadImgs(imgs, job);
-        const note = [d.skipped ? `дубль пропущен: ${d.skipped}` : '', d.failed ? `НЕ СКАЧАНО: ${d.failed}` : ''].filter(Boolean).join(' · ');
-        log(`${job.label} готово · скачано ${d.saved} из ${d.total}${d.names.length ? ' → ' + d.names.join(', ') : ''}${note ? ' · ' + note : ''}`, d.failed ? 'warn' : 'ok');
-        return { ok: true, imgs: d.saved, names: d.names, dlFailed: d.failed };
-      }
-      log(`${job.label} готово · картинок: ${uniqueImgs(imgs).length}`, 'ok');
-      return { ok: true, imgs: uniqueImgs(imgs).length, names: [] };
+      return await finish(imgs);
     }
     return { ok: false, imgs: 0, refused: refusedText, reason: lastReason };
   }
