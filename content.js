@@ -293,6 +293,19 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   // уже есть настоящая ссылка (скачивание идёт по ссылке, отрисовка не нужна)
   const imgUsable = (i) => imgReady(i) || (document.hidden && hasRealSrc(i) && !isBlurred(i));
 
+  // В новой вёрстке ChatGPT у сообщений нет прежних атрибутов (data-message-author-role), поэтому ответ нельзя найти
+  // по селектору. Читаем то, что появилось на странице с момента снимка «до»: без нашего же промпта.
+  let pageBefore = '', sentNorm = '';
+  const pageText = () => (($('main') || document.body).innerText || '');
+  function newPageText() {
+    const t = pageText();
+    let i = 0;
+    const n = Math.min(t.length, pageBefore.length);
+    while (i < n && t.charCodeAt(i) === pageBefore.charCodeAt(i)) i++;
+    let tail = norm(t.slice(i));
+    if (sentNorm) tail = tail.split(sentNorm).join(' ');
+    return tail;
+  }
   function lastTurnText() {
     const turns = $$(SEL.turn);
     const el = turns[turns.length - 1] || $$(SEL.msg).pop();
@@ -1019,7 +1032,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   // ─── Лимиты ChatGPT и уведомления ───
   const LIMIT_RE = /(too many (requests|images)|rate limit|reached (the |your )?(current )?(usage |daily |hourly )?(cap|limit)|usage cap|image generation limit|слишком много запросов|достигли (текущего )?лимита|достигнут лимит|лимит[^.]{0,40}(исчерпан|достигнут)|повторите попытку|попробуйте (снова|позже|ещё раз|еще раз) через|try again (later|in))/i;
   function limitText(assistBefore = 0) {
-    const parts = assistCount() > assistBefore ? [lastTurnText()] : [];
+    const parts = assistCount() > assistBefore ? [lastTurnText()] : [newPageText()];
     for (const e of $$('[role="alert"], [role="dialog"], [role="status"], [data-testid*="toast" i], [class*="toast" i]')) {
       if (isVisible(e) && !host.contains(e)) parts.push(e.innerText || '');
     }
@@ -1055,8 +1068,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   function detectRefusal(assistBefore = 0) {
     // Только ответ ассистента: в сообщении пользователя (наш промпт) такие слова ничего не значат
     const answers = $$('[data-message-author-role="assistant"]');
-    if (answers.length <= assistBefore) return null;
-    const t = answers[answers.length - 1].textContent || '';
+    const t = answers.length > assistBefore ? (answers[answers.length - 1].textContent || '') : newPageText();
     const m = t.match(REFUSAL_RE);
     return m ? norm(t.slice(Math.max(0, m.index - 20), m.index + 140)) : null;
   }
@@ -1325,6 +1337,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       setStatus('gen', 'Ждём, пока ChatGPT освободится');
       await waitIdle();
       const before = new Set(allImgs().flatMap((i) => [srcOf(i), imageKey(srcOf(i))]));
+      pageBefore = pageText(); sentNorm = '';
       const turns = countTurns();
       const assist = assistCount();
 
@@ -1369,6 +1382,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       // 5) Отправка и ожидание
       setStatus('gen', 'Отправка');
       const sendWait = att.length ? 180000 : libRefs.length ? 60000 : 10000;
+      sentNorm = norm(text);
       if (!(await clickSend(el, turns, sendWait))) { log(`${job.label}: не удалось нажать «Отправить»`, 'err'); continue; }
       log(`${job.label} отправлен`, 'info');
 
@@ -1395,7 +1409,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       if (!imgs.length) {
         // Что ChatGPT ответил вместо картинки: без этого причину сбоя не видно
         const answers = $$('[data-message-author-role="assistant"]');
-        const said = answers.length > assist ? norm(answers[answers.length - 1].textContent || '').slice(0, 300) : '';
+        const said = (answers.length > assist ? norm(answers[answers.length - 1].textContent || '') : newPageText()).slice(0, 300);
         lastReason = 'картинка не появилась';
         log(`${job.label}: картинка не появилась${said ? ` — ChatGPT ответил: «${said}»` : ' — ответа ChatGPT в чате нет'}`, 'err');
         continue;
