@@ -105,7 +105,7 @@ DO NOT: add any new element, text or decoration; move, resize, restyle, recolour
 
 RESULT: the same scene, isolated on a clean pure black background — only the objects, their lines and arrows, shadows and native glow — ready for compositing with the Screen blend mode. Clean edges, no dark halo or grey fringe around objects.`,
     editSuffix: '_black', followUp: false, editOpen: false,
-    libName: '', notify: true, skipFailed: true, perRunFolder: true, onlyFinal: true,
+    libName: '', notify: true, skipFailed: true, perRunFolder: true, onlyFinal: true, saveAnswers: false,
     runFolder: '', csvName: '', failed: [], resultsMap: {}, savedKeys: [],
     open: true, settingsOpen: false, logOpen: true, pos: null,
   };
@@ -1481,7 +1481,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       if (!S.waitImage) {
         // Текстовый режим: ответ — то, что появилось на странице после отправки (без нашего промпта и служебной приписки)
         const answer = norm(newPageText().replace(/ChatGPT может допускать ошибки[^.]*\.?(\s*Проверяйте[^.]*\.)?/gi, '')).slice(0, 30000);
-        log(`${job.label} готово · ответ ${answer.length} симв.`, answer ? 'ok' : 'warn');
+        log(`${job.label} готово${S.saveAnswers ? ` · ответ ${answer.length} симв.` : ''}`, 'ok');
         return { ok: true, imgs: 0, names: [], answer };
       }
       let imgs = newImages(before).filter(imgUsable);
@@ -1500,7 +1500,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
         const said = (answers.length > assist ? norm(answers[answers.length - 1].textContent || '') : newPageText()).slice(0, 300);
         lastReason = 'картинка не появилась';
         log(`${job.label}: картинка не появилась${said ? ` — ChatGPT ответил: «${said}»` : ' — ответа ChatGPT в чате нет'}`, 'err');
-        if (said.length > 80 && !S.waitImage === false) log('ChatGPT ответил текстом. Если вам нужен текст, а не картинка, выключите «Ждать картинку» в настройках: тогда очередь пойдёт дальше и сохранит ответы в answers.csv', 'warn');
+        if (said.length > 80 && !S.waitImage === false) log('ChatGPT ответил текстом. Если вам нужен текст, а не картинка, выключите «Ждать картинку» в настройках: тогда очередь просто пойдёт дальше (ответы можно сохранять переключателем «Сохранять текстовые ответы»)', 'warn');
         continue;
       }
       return await finish(imgs);
@@ -1641,7 +1641,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
             if (fx.ok && fx.names.length) res.names = res.names.concat(fx.names.map((n) => `edited/${n}`));
           }
           recordResult({ num: job.num, status, files: (res.names || []).join(', '), prompt: job.display, sec, answer: res.answer });
-          if (!S.waitImage) { try { await writeAnswers(); } catch (e) { dbg(`Не записались ответы: ${e.message}`); } }
+          if (!S.waitImage && S.saveAnswers) { try { await writeAnswers(); } catch (e) { dbg(`Не записались ответы: ${e.message}`); } }
         }
 
         S.failed = [...failedSet];
@@ -2013,8 +2013,12 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
             </div>
             <div class="divider"></div>
             <label class="sw-row">
-              <div><div class="t">Ждать картинку</div><div class="d">Считать ответ готовым, только когда картинка догрузилась. Выключите, если нужен только текст: ответы сохранятся в answers.csv и answers.txt</div></div>
+              <div><div class="t">Ждать картинку</div><div class="d">Считать ответ готовым, только когда картинка догрузилась. Выключите, если нужны только текстовые ответы: очередь просто идёт к следующему промпту</div></div>
               <span class="sw"><input type="checkbox" data-k="waitImage"><span></span></span>
+            </label>
+            <label class="sw-row">
+              <div><div class="t">Сохранять текстовые ответы</div><div class="d">Только когда «Ждать картинку» выключено: ответы пишутся в answers.csv и answers.txt в папке запуска</div></div>
+              <span class="sw"><input type="checkbox" data-k="saveAnswers"><span></span></span>
             </label>
             <label class="sw-row">
               <div><div class="t">Уведомления</div><div class="d">Сообщать, когда очередь закончилась, встала на паузу или ждёт лимит</div></div>
