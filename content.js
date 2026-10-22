@@ -358,7 +358,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
   // Очередь привязана к чату, в котором её запустили: перешли в другой — останавливаемся,
   // а не начинаем слать промпты туда. Пустой чат (/) после первой отправки становится /c/<id> — это тот же чат.
   const chatPath = () => location.pathname.replace(/\/+$/, '') || '/';
-  const chatId = (p) => (p.match(/\/c\/([0-9a-f-]{8,})/i) || [])[1] || '';
+  const chatId = (p) => (p.match(/\/c\/([^/?#]+)/) || [])[1] || '';
   function checkChat() {
     if (!run.chatPath) return;
     const cur = chatPath();
@@ -1339,6 +1339,20 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     return left.length;
   }
 
+  // Текстовый режим: таблица «№ — промпт — ответ» рядом с картинками (в папке запуска) и обычный текст для чтения
+  async function writeAnswers() {
+    const list = Object.values(S.resultsMap || {}).filter((r) => r.answer !== undefined).sort((a, b) => a.num - b.num);
+    if (!list.length) return;
+    const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const csv = '\ufeff' + [['№', 'промпт', 'ответ']].concat(list.map((r) => [r.num, r.prompt || '', r.answer || ''])).map((r) => r.map(esc).join(';')).join('\r\n');
+    const txt = '\ufeff' + list.map((r) => `### №${r.num}\n${r.prompt || ''}\n\n${r.answer || ''}\n`).join('\n---\n\n');
+    const dir = downloadDir('');
+    const base = dir ? dir + '/' : '';
+    const a = await saveFile('data:text/csv;charset=utf-8,' + encodeURIComponent(csv), `${base}answers.csv`);
+    const b = await saveFile('data:text/plain;charset=utf-8,' + encodeURIComponent(txt), `${base}answers.txt`);
+    if (!a.ok || !b.ok) dbg(`Ответы не записались: ${a.error || b.error}`);
+  }
+
   const fmtTime = (sec) => (sec >= 60 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}` : `${sec} с`);
 
   // ─── Основной цикл ───
@@ -1464,7 +1478,12 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       refusedText = '';
 
       // 6) Результат
-      if (!S.waitImage) { log(`${job.label} готово`, 'ok'); return { ok: true, imgs: 0, names: [] }; }
+      if (!S.waitImage) {
+        // Текстовый режим: ответ — то, что появилось на странице после отправки (без нашего промпта и служебной приписки)
+        const answer = norm(newPageText().replace(/ChatGPT может допускать ошибки[^.]*\.?(\s*Проверяйте[^.]*\.)?/gi, '')).slice(0, 30000);
+        log(`${job.label} готово · ответ ${answer.length} симв.`, answer ? 'ok' : 'warn');
+        return { ok: true, imgs: 0, names: [], answer };
+      }
       let imgs = newImages(before).filter(imgUsable);
       if (!imgs.length) imgs = newImages(before, true).filter(imgUsable);
       if (!imgs.length) {
@@ -1620,7 +1639,8 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
             else { log(`${job.label}: доработка не получилась — идём дальше`, 'warn'); status += ', доработка не вышла'; }
             if (fx.ok && fx.names.length) res.names = res.names.concat(fx.names.map((n) => `edited/${n}`));
           }
-          recordResult({ num: job.num, status, files: (res.names || []).join(', '), prompt: job.display, sec });
+          recordResult({ num: job.num, status, files: (res.names || []).join(', '), prompt: job.display, sec, answer: res.answer });
+          if (!S.waitImage) { try { await writeAnswers(); } catch (e) { dbg(`Не записались ответы: ${e.message}`); } }
         }
 
         S.failed = [...failedSet];
@@ -1992,7 +2012,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
             </div>
             <div class="divider"></div>
             <label class="sw-row">
-              <div><div class="t">Ждать картинку</div><div class="d">Считать ответ готовым, только когда картинка догрузилась</div></div>
+              <div><div class="t">Ждать картинку</div><div class="d">Считать ответ готовым, только когда картинка догрузилась. Выключите, если нужен только текст: ответы сохранятся в answers.csv и answers.txt</div></div>
               <span class="sw"><input type="checkbox" data-k="waitImage"><span></span></span>
             </label>
             <label class="sw-row">
