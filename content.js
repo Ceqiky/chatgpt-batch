@@ -1500,6 +1500,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
         const said = (answers.length > assist ? norm(answers[answers.length - 1].textContent || '') : newPageText()).slice(0, 300);
         lastReason = 'картинка не появилась';
         log(`${job.label}: картинка не появилась${said ? ` — ChatGPT ответил: «${said}»` : ' — ответа ChatGPT в чате нет'}`, 'err');
+        if (said.length > 80 && !S.waitImage === false) log('ChatGPT ответил текстом. Если вам нужен текст, а не картинка, выключите «Ждать картинку» в настройках: тогда очередь пойдёт дальше и сохранит ответы в answers.csv', 'warn');
         continue;
       }
       return await finish(imgs);
