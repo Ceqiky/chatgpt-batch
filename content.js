@@ -583,17 +583,47 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
     throw new Error(`не удалось выбрать «${name}» из библиотеки (@)`);
   }
 
+  // Сообщения пользователя в чате: счётчик turn/msg на новой разметке ChatGPT даёт 0, поэтому считаем по роли
+  const userCount = () => $$('[data-message-author-role="user"]').length;
   // Отправка уже произошла? (поле очистилось / пошла генерация / появилось новое сообщение)
-  const sentOk = (el, turnsBefore) => isGenerating() || countTurns() > turnsBefore || !norm(inputText(el));
+  const sentOk = (el, turnsBefore, usersBefore = 0) =>
+    isGenerating() || countTurns() > turnsBefore || userCount() > usersBefore || !norm(inputText(el));
 
-  async function clickSend(el, turnsBefore, waitMs = 10000) {
-    // 1) ждём активную кнопку «Отправить» (с файлами — дольше: пока идёт загрузка, она неактивна)
+  // Файл ещё грузится: кнопка «Ожидание загрузки файла» или индикатор загрузки в поле ввода.
+  // Клик в этот момент ChatGPT ставит в очередь и отправляет позже — отсюда дубли при повторе.
+  const UPLOAD_RE = /(ожидани\w*\s+загрузк|загрузк\w*\s+файл|uploading|waiting for (the )?upload|upload in progress)/i;
+  function uploadPending() {
+    const root = composerRoot();
+    if (!root) return false;
+    if ($$('button', root).some((b) => !host.contains(b) && UPLOAD_RE.test(`${b.getAttribute('aria-label') || ''} ${b.title || ''}`))) return true;
+    return !!$('[role="progressbar"]', root);
+  }
+
+  // clickSend вернул «не вышло», но ChatGPT мог принять отправку и выполнить её позже (после загрузки файла).
+  // Ждём, не пошла ли генерация, — иначе повтор отправит тот же промпт второй раз.
+  async function sentLate(before, usersBefore, ms = 20000) {
     const t0 = Date.now();
-    let btn = null;
+    while (Date.now() - t0 < ms || (uploadPending() && Date.now() - t0 < 120000)) {
+      checkStop();
+      if (isGenerating() || userCount() > usersBefore || newImages(before).length) return true;
+      await sleep(500);
+    }
+    return false;
+  }
+
+  async function clickSend(el, turnsBefore, waitMs = 10000, usersBefore = 0) {
+    // 1) ждём кнопку «Отправить», пока файлы не догрузятся. С файлами кнопка может стать активной
+    //    ещё во время загрузки, поэтому требуем, чтобы так было ~1,5 с подряд
+    const t0 = Date.now();
+    const settle = waitMs > 10000 ? 1500 : 0;
+    let btn = null, okSince = 0;
     while (Date.now() - t0 < waitMs) {
       checkStop();
-      btn = findSend();
-      if (btn) break;
+      const b = findSend();
+      if (b && !uploadPending()) {
+        okSince = okSince || Date.now();
+        if (Date.now() - okSince >= settle) { btn = b; break; }
+      } else okSince = 0;
       if (waitMs > 10000) setStatus('gen', `Загрузка файлов… ${Math.round((Date.now() - t0) / 1000)} с`);
       await sleep(300);
     }
@@ -612,12 +642,22 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       if (form && form.requestSubmit) form.requestSubmit(); else throw new Error('нет формы');
     }]);
 
-    // 2) пробуем способы, пока отправка не подтвердится
+    // 2) пробуем способы, пока отправка не подтвердится. Если файл ещё грузится, сообщение стоит в очереди:
+    //    ждём, а не нажимаем другим способом (второе нажатие = второе сообщение)
     for (const [name, fn] of tries) {
+      if (sentOk(el, turnsBefore, usersBefore)) { dbg(`Отправлено (до способа «${name}»)`); return true; }
+      if (uploadPending()) {
+        const t2 = Date.now();
+        while (uploadPending() && Date.now() - t2 < 120000) {
+          checkStop();
+          if (sentOk(el, turnsBefore, usersBefore)) { dbg('Отправлено после загрузки файла'); return true; }
+          await sleep(300);
+        }
+      }
       try { fn(); } catch (e) { dbg(`Отправка «${name}» упала: ${e.message}`); continue; }
       const t1 = Date.now();
-      while (Date.now() - t1 < 4000) {
-        if (sentOk(el, turnsBefore)) { dbg(`Отправлено способом «${name}»`); return true; }
+      while (Date.now() - t1 < 5000 || (uploadPending() && Date.now() - t1 < 120000)) {
+        if (sentOk(el, turnsBefore, usersBefore)) { dbg(`Отправлено способом «${name}»`); return true; }
         await sleep(200);
       }
       dbg(`Отправка «${name}» не подтвердилась`);
@@ -1156,6 +1196,7 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       await waitIdle();
       const before = new Set(allImgs().map(srcOf));
       const turns = countTurns();
+      const users = userCount();
       const assist = assistCount();
 
       // 1) Чистое поле: убираем текст и вложения, оставшиеся от прошлой попытки
@@ -1198,7 +1239,15 @@ RESULT: the same scene, isolated on a clean pure black background — only the o
       // 5) Отправка и ожидание
       setStatus('gen', 'Отправка');
       const sendWait = att.length ? 180000 : libRefs.length ? 60000 : 10000;
-      if (!(await clickSend(el, turns, sendWait))) { log(`${job.label}: не удалось нажать «Отправить»`, 'err'); continue; }
+      if (!(await clickSend(el, turns, sendWait, users))) {
+        // Сообщение могло уйти с опозданием (после загрузки файла): не шлём повторно, а ждём результат
+        if (!(await sentLate(before, users))) {
+          log(`${job.label}: не удалось нажать «Отправить»`, 'err');
+          await cleanupComposer(); // убираем текст и вложения: отменяет и сообщение в очереди
+          continue;
+        }
+        log(`${job.label}: сообщение ушло с задержкой — повторно не отправляю`, 'warn');
+      }
       log(`${job.label} отправлен`, 'info');
 
       const r = await waitDone(before, turns, assist);
